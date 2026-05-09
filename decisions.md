@@ -18,3 +18,14 @@
 
 5. Prioritize speed to first feature
 - Set up dependencies and app entry structure now so feature implementation can begin immediately.
+
+## 2026-05-09
+
+1. Use Better Auth for authentication
+- Better Auth will own identity, password auth, sessions, and auth persistence instead of custom auth code.
+
+2. Keep workspace authorization app-owned
+- The app will own workspaces, memberships, roles, and permission checks because those are product concepts.
+
+3. Build a thin Phase 0.5 before continuing Phase 1
+- Add only the local foundation needed for auth and workspaces now: PostgreSQL, env config, migrations, and setup docs. Defer Redis and MinIO until their phases.
