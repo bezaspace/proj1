@@ -1,6 +1,6 @@
 # WorkspaceOS
 
-WorkspaceOS is a React + Vite frontend with an Express backend. The current build target is the first usable collaboration shell: Better Auth identity, PostgreSQL-backed workspaces, and protected app routes.
+WorkspaceOS is a React + Vite frontend with an Express backend. The current build target is a usable collaboration shell with Better Auth identity, PostgreSQL-backed workspace metadata, document history, and Drive-like file storage on MinIO.
 
 ## Prerequisites
 
@@ -9,10 +9,10 @@ WorkspaceOS is a React + Vite frontend with an Express backend. The current buil
 
 ## Local Setup
 
-1. Start Postgres:
+1. Start local services:
 
    ```bash
-   docker compose up -d postgres
+   docker compose up -d postgres minio
    ```
 
 2. Configure backend env:
@@ -55,6 +55,8 @@ WorkspaceOS is a React + Vite frontend with an Express backend. The current buil
 
 - Sign up with email and password.
 - Create a workspace.
+- Create documents, save edits, and inspect document version history.
+- Open Files, create folders, upload a file, download it, and upload a replacement version.
 - Refresh the page and stay authenticated.
 - Log out and return to the auth screen.
 
@@ -62,4 +64,6 @@ WorkspaceOS is a React + Vite frontend with an Express backend. The current buil
 
 - Better Auth owns auth users, accounts, sessions, and verification tables.
 - The app owns workspaces, memberships, roles, and audit events.
-- Redis, MinIO, uploads, realtime, sharing, chat, and notifications are intentionally deferred to later phases.
+- PostgreSQL stores document/file/folder metadata and immutable version rows.
+- MinIO stores file bytes. The API issues signed upload/download URLs so app servers stay stateless and do not proxy object bytes.
+- Redis, realtime, sharing, chat, notifications, and rate limiting are intentionally deferred to later phases.

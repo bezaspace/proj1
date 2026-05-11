@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+cd "$ROOT_DIR"
+docker compose up -d postgres minio
+
+cd "$ROOT_DIR/backend"
+
+if [[ -f .env ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source .env
+  set +a
+fi
+
+export DATABASE_URL="${DATABASE_URL:-postgresql://postgres:postgres@localhost:55432/workspaceos}"
+export BETTER_AUTH_SECRET="${BETTER_AUTH_SECRET:-local-dev-secret-at-least-32-characters}"
+export BETTER_AUTH_URL="${BETTER_AUTH_URL:-http://localhost:4000}"
+export FRONTEND_URL="${FRONTEND_URL:-http://localhost:5173}"
+export OBJECT_STORAGE_ENDPOINT="${OBJECT_STORAGE_ENDPOINT:-localhost}"
+export OBJECT_STORAGE_PORT="${OBJECT_STORAGE_PORT:-9010}"
+export OBJECT_STORAGE_USE_SSL="${OBJECT_STORAGE_USE_SSL:-false}"
+export OBJECT_STORAGE_ACCESS_KEY="${OBJECT_STORAGE_ACCESS_KEY:-workspaceos}"
+export OBJECT_STORAGE_SECRET_KEY="${OBJECT_STORAGE_SECRET_KEY:-workspaceos-secret}"
+export OBJECT_STORAGE_BUCKET="${OBJECT_STORAGE_BUCKET:-workspaceos-files}"
+export OBJECT_STORAGE_REGION="${OBJECT_STORAGE_REGION:-us-east-1}"
+
+exec npm run dev "$@"

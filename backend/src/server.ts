@@ -6,6 +6,9 @@ import { auth } from './lib/auth.js'
 import { env } from './env.js'
 import { meRouter } from './routes/me.js'
 import { workspacesRouter } from './routes/workspaces.js'
+import { documentsRouter } from './routes/documents.js'
+import { filesRouter } from './routes/files.js'
+import { ensureObjectStorageBucket } from './lib/object-storage.js'
 
 const app = express()
 
@@ -31,7 +34,16 @@ app.get('/', (_req, res) => {
 
 app.use('/api', meRouter)
 app.use('/api', workspacesRouter)
+app.use('/api', documentsRouter)
+app.use('/api', filesRouter)
 
-app.listen(env.port, () => {
-  console.log(`Backend running at http://localhost:${env.port}`)
-})
+ensureObjectStorageBucket()
+  .then(() => {
+    app.listen(env.port, () => {
+      console.log(`Backend running at http://localhost:${env.port}`)
+    })
+  })
+  .catch((error) => {
+    console.error('Failed to initialize object storage', error)
+    process.exit(1)
+  })
