@@ -2,6 +2,8 @@ import { Router } from 'express'
 import { and, desc, eq, inArray, isNull, max } from 'drizzle-orm'
 import { db } from '../db/index.js'
 import { auditEvents, documentVersions, documents, resourcePermissions } from '../db/schema.js'
+import { appendActivity } from '../lib/activity.js'
+import { rateLimit } from '../lib/rate-limit.js'
 import { getEffectiveResourcePermission, requireResourcePermission, requireWorkspaceRole } from '../lib/workspace-access.js'
 import { requireAuth } from '../middleware/auth.js'
 
@@ -107,7 +109,7 @@ documentsRouter.get('/workspaces/:workspaceId/documents', async (req, res) => {
   res.json({ documents: serializedRows })
 })
 
-documentsRouter.post('/workspaces/:workspaceId/documents', async (req, res) => {
+documentsRouter.post('/workspaces/:workspaceId/documents', rateLimit({ keyPrefix: 'document_create', limit: 60, windowSeconds: 60 }), async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId } = req.params
   const title = normalizeTitle(req.body?.title) || 'Untitled document'
@@ -158,6 +160,16 @@ documentsRouter.post('/workspaces/:workspaceId/documents', async (req, res) => {
       action: 'document.created',
       workspaceId,
       metadata: JSON.stringify({ documentId: createdDocument.id, title }),
+    })
+
+    await appendActivity(tx, {
+      workspaceId,
+      actorUserId: userId,
+      eventType: 'document.created',
+      entityType: 'document',
+      entityId: createdDocument.id,
+      summary: `Document "${createdDocument.title}" was created`,
+      metadata: { title: createdDocument.title },
     })
 
     return createdDocument
@@ -236,7 +248,10 @@ documentsRouter.get('/workspaces/:workspaceId/documents/:documentId/versions', a
   res.json({ versions })
 })
 
-documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (req, res) => {
+documentsRouter.patch(
+  '/workspaces/:workspaceId/documents/:documentId',
+  rateLimit({ keyPrefix: 'document_update', limit: 120, windowSeconds: 60 }),
+  async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, documentId } = req.params
   const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
@@ -303,13 +318,24 @@ documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (r
       metadata: JSON.stringify({ documentId, versionNumber: nextVersion }),
     })
 
+    await appendActivity(tx, {
+      workspaceId,
+      actorUserId: userId,
+      eventType: 'document.updated',
+      entityType: 'document',
+      entityId: documentId,
+      summary: `Document "${updatedDocument.title}" was saved`,
+      metadata: { versionNumber: nextVersion, title: updatedDocument.title },
+    })
+
     return updatedDocument
   })
 
   res.json({
     document: { ...document, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') },
   })
-})
+  },
+)
 
 documentsRouter.delete('/workspaces/:workspaceId/documents/:documentId', async (req, res) => {
   const userId = req.auth!.user.id
@@ -366,6 +392,16 @@ documentsRouter.delete('/workspaces/:workspaceId/documents/:documentId', async (
       action: 'document.archived',
       workspaceId,
       metadata: JSON.stringify({ documentId, versionNumber: nextVersion }),
+    })
+
+    await appendActivity(tx, {
+      workspaceId,
+      actorUserId: userId,
+      eventType: 'document.archived',
+      entityType: 'document',
+      entityId: documentId,
+      summary: `Document "${archivedDocument.title}" was archived`,
+      metadata: { versionNumber: nextVersion, title: archivedDocument.title },
     })
 
     return archivedDocument

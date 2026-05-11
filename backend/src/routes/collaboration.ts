@@ -5,7 +5,6 @@ import {
   auditEvents,
   documents,
   files,
-  notifications,
   resourcePermissions,
   users,
   workspaceInvites,
@@ -19,7 +18,11 @@ import {
   type ResourceType,
   type WorkspaceRole,
 } from '../lib/workspace-access.js'
-import { publishNotification } from '../lib/notifications.js'
+import { appendActivity } from '../lib/activity.js'
+import { cacheKeys, invalidateCachePatterns } from '../lib/cache.js'
+import { createNotification } from '../lib/notifications.js'
+import { enqueueOutboxEvent } from '../lib/outbox.js'
+import { rateLimit } from '../lib/rate-limit.js'
 import { requireAuth } from '../middleware/auth.js'
 
 export const collaborationRouter = Router()
@@ -192,7 +195,10 @@ collaborationRouter.get('/workspaces/:workspaceId/invites', async (req, res) => 
   res.json({ invites: rows })
 })
 
-collaborationRouter.post('/workspaces/:workspaceId/invites', async (req, res) => {
+collaborationRouter.post(
+  '/workspaces/:workspaceId/invites',
+  rateLimit({ keyPrefix: 'workspace_invite_create', limit: 20, windowSeconds: 60 }),
+  async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId } = req.params
   const email = normalizeEmail(req.body?.email)
@@ -263,36 +269,37 @@ collaborationRouter.post('/workspaces/:workspaceId/invites', async (req, res) =>
       metadata: JSON.stringify({ inviteId: savedInvite.id, email, role }),
     })
 
-    const savedNotifications: Array<typeof notifications.$inferSelect> = []
-
     if (invitedUser) {
-      const rows = await tx
-        .insert(notifications)
-        .values({
-          recipientUserId: invitedUser.id,
-          actorUserId: userId,
-          workspaceId,
-          type: 'workspace_invite',
-          entityType: 'workspace_invite',
-          entityId: savedInvite.id,
-          title: 'Workspace invite',
-          body: 'You have been invited to join a workspace.',
-          metadata: JSON.stringify({ workspaceId, inviteId: savedInvite.id, role }),
-          dedupeKey: `workspace_invite:${savedInvite.id}`,
-        })
-        .onConflictDoNothing()
-        .returning()
-
-      savedNotifications.push(...rows)
+      await createNotification(tx, {
+        recipientUserId: invitedUser.id,
+        actorUserId: userId,
+        workspaceId,
+        type: 'workspace_invite',
+        entityType: 'workspace_invite',
+        entityId: savedInvite.id,
+        title: 'Workspace invite',
+        body: 'You have been invited to join a workspace.',
+        metadata: { workspaceId, inviteId: savedInvite.id, role },
+        dedupeKey: `workspace_invite:${savedInvite.id}`,
+      })
     }
 
-    return { invite: savedInvite, notifications: savedNotifications }
+    await appendActivity(tx, {
+      workspaceId,
+      actorUserId: userId,
+      eventType: existingInvite ? 'workspace.invite_refreshed' : 'workspace.invite_created',
+      entityType: 'workspace_invite',
+      entityId: savedInvite.id,
+      summary: `${email} was invited as ${role}`,
+      metadata: { inviteId: savedInvite.id, email, role },
+    })
+
+    return { invite: savedInvite }
   })
 
-  await Promise.all(payload.notifications.map((notification) => publishNotification(notification)))
-
   res.status(201).json({ invite: payload.invite })
-})
+  },
+)
 
 collaborationRouter.get('/invites', async (req, res) => {
   const email = normalizeEmail(req.auth!.user.email)
@@ -370,6 +377,28 @@ collaborationRouter.post('/invites/:inviteId/accept', async (req, res) => {
       metadata: JSON.stringify({ inviteId: invite.id, role: invite.role }),
     })
 
+    await appendActivity(tx, {
+      workspaceId: invite.workspaceId,
+      actorUserId: userId,
+      eventType: 'workspace.invite_accepted',
+      entityType: 'workspace_invite',
+      entityId: invite.id,
+      summary: `Workspace invite was accepted`,
+      metadata: { inviteId: invite.id, role: invite.role },
+    })
+
+    await enqueueOutboxEvent(tx, {
+      eventType: 'cache.invalidate',
+      aggregateType: 'workspace',
+      aggregateId: invite.workspaceId,
+      workspaceId: invite.workspaceId,
+      actorUserId: userId,
+      payload: { patterns: [cacheKeys.membership(invite.workspaceId, userId)] },
+      idempotencyKey: `cache:membership:${invite.workspaceId}:${userId}:${acceptedInvite.id}`,
+      jobType: 'cache.invalidate',
+      maxAttempts: 3,
+    })
+
     const [workspace] = await tx
       .select({
         id: workspaces.id,
@@ -384,6 +413,7 @@ collaborationRouter.post('/invites/:inviteId/accept', async (req, res) => {
     return { invite: acceptedInvite, workspace: { ...workspace, role: invite.role } }
   })
 
+  await invalidateCachePatterns([cacheKeys.membership(invite.workspaceId, userId)])
   res.json(payload)
 })
 
@@ -413,6 +443,16 @@ collaborationRouter.delete('/workspaces/:workspaceId/invites/:inviteId', async (
     action: 'workspace.invite_revoked',
     workspaceId,
     metadata: JSON.stringify({ inviteId, email: invite.email }),
+  })
+
+  await appendActivity(db, {
+    workspaceId,
+    actorUserId: userId,
+    eventType: 'workspace.invite_revoked',
+    entityType: 'workspace_invite',
+    entityId: inviteId,
+    summary: `${invite.email} invite was revoked`,
+    metadata: { inviteId, email: invite.email },
   })
 
   res.json({ invite })
@@ -534,27 +574,19 @@ collaborationRouter.post('/workspaces/:workspaceId/:resourcePath/:resourceId/per
       .returning()
 
     const copy = notificationCopy(resourceType, resource.name)
-    const savedNotifications: Array<typeof notifications.$inferSelect> = []
-
     if (targetUser.id !== actorUserId) {
-      const rows = await tx
-        .insert(notifications)
-        .values({
-          recipientUserId: targetUser.id,
-          actorUserId,
-          workspaceId,
-          type: copy.type,
-          entityType: resourceType,
-          entityId: resourceId,
-          title: copy.title,
-          body: copy.body,
-          metadata: JSON.stringify({ resourceType, resourceId, resourceName: resource.name, level }),
-          dedupeKey: `${copy.type}:${resourceId}:${targetUser.id}:${level}`,
-        })
-        .onConflictDoNothing()
-        .returning()
-
-      savedNotifications.push(...rows)
+      await createNotification(tx, {
+        recipientUserId: targetUser.id,
+        actorUserId,
+        workspaceId,
+        type: copy.type,
+        entityType: resourceType,
+        entityId: resourceId,
+        title: copy.title,
+        body: copy.body,
+        metadata: { resourceType, resourceId, resourceName: resource.name, level },
+        dedupeKey: `${copy.type}:${resourceId}:${targetUser.id}:${level}`,
+      })
     }
 
     await tx.insert(auditEvents).values({
@@ -564,10 +596,30 @@ collaborationRouter.post('/workspaces/:workspaceId/:resourcePath/:resourceId/per
       metadata: JSON.stringify({ resourceId, targetUserId: targetUser.id, level }),
     })
 
-    return { grant, notifications: savedNotifications }
-  })
+    await appendActivity(tx, {
+      workspaceId,
+      actorUserId,
+      eventType: `${resourceType}.permission_granted`,
+      entityType: resourceType,
+      entityId: resourceId,
+      summary: `${resource.name} was shared with ${targetUser.email}`,
+      metadata: { resourceType, resourceId, targetUserId: targetUser.id, level },
+    })
 
-  await Promise.all(payload.notifications.map((notification) => publishNotification(notification)))
+    await enqueueOutboxEvent(tx, {
+      eventType: 'cache.invalidate',
+      aggregateType: resourceType,
+      aggregateId: resourceId,
+      workspaceId,
+      actorUserId,
+      payload: { patterns: [cacheKeys.resourceGrant(workspaceId, resourceType, resourceId, targetUser.id)] },
+      idempotencyKey: `cache:grant:${workspaceId}:${resourceType}:${resourceId}:${targetUser.id}:${grant.updatedAt.getTime()}`,
+      jobType: 'cache.invalidate',
+      maxAttempts: 3,
+    })
+
+    return { grant }
+  })
 
   const [grantWithUser] = await db
     .select(grantFields())
@@ -576,6 +628,7 @@ collaborationRouter.post('/workspaces/:workspaceId/:resourcePath/:resourceId/per
     .where(eq(resourcePermissions.id, payload.grant.id))
     .limit(1)
 
+  await invalidateCachePatterns([cacheKeys.resourceGrant(workspaceId, resourceType, resourceId, targetUser.id)])
   res.status(201).json({ grant: grantWithUser })
 })
 
@@ -627,5 +680,27 @@ collaborationRouter.delete('/workspaces/:workspaceId/:resourcePath/:resourceId/p
     metadata: JSON.stringify({ resourceId, targetUserId: grant.userId, level: grant.level }),
   })
 
+  await appendActivity(db, {
+    workspaceId,
+    actorUserId,
+    eventType: `${resourceType}.permission_revoked`,
+    entityType: resourceType,
+    entityId: resourceId,
+    summary: `${resource.name} access was revoked`,
+    metadata: { resourceType, resourceId, targetUserId: grant.userId, level: grant.level },
+  })
+
+  await enqueueOutboxEvent(db, {
+    eventType: 'cache.invalidate',
+    aggregateType: resourceType,
+    aggregateId: resourceId,
+    workspaceId,
+    actorUserId,
+    payload: { patterns: [cacheKeys.resourceGrant(workspaceId, resourceType, resourceId, grant.userId)] },
+    idempotencyKey: `cache:grant-revoke:${workspaceId}:${resourceType}:${resourceId}:${grant.userId}:${grant.id}`,
+    jobType: 'cache.invalidate',
+    maxAttempts: 3,
+  })
+  await invalidateCachePatterns([cacheKeys.resourceGrant(workspaceId, resourceType, resourceId, grant.userId)])
   res.json({ grant })
 })

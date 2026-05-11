@@ -1,7 +1,8 @@
 import { Router } from 'express'
 import { and, desc, eq } from 'drizzle-orm'
 import { db } from '../db/index.js'
-import { auditEvents, workspaceMembers, workspaces } from '../db/schema.js'
+import { auditEvents, chatChannels, workspaceMembers, workspaces } from '../db/schema.js'
+import { appendActivity } from '../lib/activity.js'
 import { requireAuth } from '../middleware/auth.js'
 
 export const workspacesRouter = Router()
@@ -51,11 +52,27 @@ workspacesRouter.post('/workspaces', async (req, res) => {
       role: 'owner',
     })
 
+    await tx.insert(chatChannels).values({
+      workspaceId: createdWorkspace.id,
+      name: 'general',
+      createdByUserId: userId,
+    })
+
     await tx.insert(auditEvents).values({
       actorUserId: userId,
       action: 'workspace.created',
       workspaceId: createdWorkspace.id,
       metadata: JSON.stringify({ name }),
+    })
+
+    await appendActivity(tx, {
+      workspaceId: createdWorkspace.id,
+      actorUserId: userId,
+      eventType: 'workspace.created',
+      entityType: 'workspace',
+      entityId: createdWorkspace.id,
+      summary: `Workspace "${createdWorkspace.name}" was created`,
+      metadata: { name: createdWorkspace.name },
     })
 
     return [createdWorkspace]

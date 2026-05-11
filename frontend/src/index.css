@@ -475,6 +475,126 @@ label {
   gap: 14px;
 }
 
+.chat-view,
+.activity-view {
+  display: grid;
+  gap: 18px;
+}
+
+.presence-strip {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.presence-strip span {
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: #1f6f68;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 900;
+}
+
+.chat-grid {
+  display: grid;
+  grid-template-columns: 250px minmax(0, 1fr);
+  gap: 18px;
+  min-height: 520px;
+}
+
+.chat-sidebar,
+.chat-panel {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+}
+
+.channel-list,
+.message-list,
+.activity-list {
+  display: grid;
+  align-content: start;
+  gap: 8px;
+}
+
+.channel-item {
+  justify-content: flex-start;
+  min-height: 42px;
+  border: 1px solid #d8e1ec;
+  background: #fff;
+  color: #243043;
+  padding: 0 12px;
+  text-align: left;
+}
+
+.channel-item.active {
+  border-color: #1f6f68;
+  background: #e9f6f4;
+  color: #1f6f68;
+}
+
+.chat-panel {
+  border: 1px solid #d8e1ec;
+  border-radius: 8px;
+  padding: 16px;
+  background: #f8fafc;
+}
+
+.message-list {
+  max-height: 420px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.message-row,
+.activity-row {
+  display: grid;
+  gap: 6px;
+  border: 1px solid #d8e1ec;
+  border-radius: 8px;
+  padding: 10px 12px;
+  background: #fff;
+}
+
+.message-row div,
+.activity-row div {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.message-row small,
+.activity-row small,
+.typing-line {
+  color: #66758b;
+  font-size: 0.78rem;
+}
+
+.message-row p {
+  margin: 0;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.typing-line {
+  min-height: 20px;
+  margin: 0;
+  font-weight: 700;
+}
+
+.message-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+}
+
 .share-form {
   display: grid;
   grid-template-columns: minmax(0, 1fr) 120px auto;
@@ -807,8 +927,10 @@ button.compact {
   .workspace-layout,
   .documents-grid,
   .files-grid,
+  .chat-grid,
   .version-layout,
   .inline-form,
+  .message-form,
   .drive-item,
   .share-form,
   .people-grid {

@@ -31,3 +31,27 @@ export function createDownloadUrl(objectKey: string, fileName: string) {
 export async function statStoredObject(objectKey: string) {
   return objectStorage.statObject(env.objectStorage.bucket, objectKey)
 }
+
+export function createBlockUploadUrl(objectKey: string) {
+  return objectStorage.presignedPutObject(env.objectStorage.bucket, objectKey, 15 * 60)
+}
+
+export async function composeStoredObject(targetObjectKey: string, sourceObjectKeys: string[]) {
+  const destination = new Minio.CopyDestinationOptions({
+    Bucket: env.objectStorage.bucket,
+    Object: targetObjectKey,
+  })
+  const sources = sourceObjectKeys.map(
+    (objectKey) =>
+      new Minio.CopySourceOptions({
+        Bucket: env.objectStorage.bucket,
+        Object: objectKey,
+      }),
+  )
+
+  return objectStorage.composeObject(destination, sources)
+}
+
+export async function removeStoredObject(objectKey: string) {
+  return objectStorage.removeObject(env.objectStorage.bucket, objectKey)
+}

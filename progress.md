@@ -2,7 +2,7 @@
 
 ## Current Status
 
-WorkspaceOS now has a working auth and workspace shell, completed Phase 2 documents, completed Phase 3 Drive storage, the first Phase 4 collaboration layer, and a Phase 5 realtime document foundation. Users can authenticate, create/select workspaces, invite teammates, accept workspace invites, create/share documents and files, enforce resource-level permissions, edit shared documents live with CRDT sync and presence, and receive persisted in-app notifications for invites, shares, and document updates.
+WorkspaceOS now has a working systems-level collaboration backend showcase. Users can authenticate, create/select workspaces, invite teammates, accept workspace invites, create/share documents and files, enforce resource-level permissions, edit shared documents live with CRDT sync and presence, chat in realtime channels, see workspace presence/typing, receive outbox-backed notifications, inspect an append-only activity feed, create public share links, and use workspace search/autocomplete.
 
 ## Completed
 
@@ -25,14 +25,25 @@ WorkspaceOS now has a working auth and workspace shell, completed Phase 2 docume
 - Documents now use Yjs CRDT updates for live collaboration, with durable PostgreSQL snapshots.
 - Document room presence, heartbeat cleanup, reconnect handling, and patch rate limiting exist.
 - Realtime notification events update online clients when new notifications are created.
+- Transactional outbox, background job, and job attempt tables exist, with an in-process worker loop and standalone worker script.
+- Notification delivery tracking and notification preferences exist, with realtime delivery performed by background jobs.
+- Workspace activity events are append-only and cursor-paginated.
+- Workspace chat channels and messages exist with per-channel sequence numbers and client idempotency keys.
+- Workspace-wide Redis presence and typing events exist over the authenticated realtime socket.
+- Reusable Redis-backed rate limiting exists for document updates, upload intents, invites, channel creation, and chat sends.
+- Resumable/block file upload sessions exist with block checksums, block dedupe, MinIO object composition, expiration, and worker cleanup.
+- Public document/file share links exist with short tokens, optional passwords, expiration, revocation, anonymous rate limiting, and access counters.
+- Workspace search/autocomplete exists across documents, files, chat messages, and popular prior queries.
+- Redis-backed hot authorization cache entries exist for workspace membership and resource grants, with explicit and outbox-backed invalidation.
+- Structured JSON request/error logs, request IDs, latency metrics, queue metrics, `/metrics`, `/ready`, and authenticated `/api/system/queues` exist.
 - Setup and demo flow are documented in `README.md`.
 
 ## In Progress / Next
 
-- Run the full local stack with Postgres, Redis, and MinIO and manually exercise the complete two-user invite/share/revoke/realtime-edit demo flow.
-- Continue Phase 5 polish around conflict UX, offline recovery, and richer cursor indicators, or move into Phase 6 chat and workspace presence.
+- Run the full two-user systems demo: invite/share/revoke/realtime-edit/chat/mention/activity/public-link/search/rate-limit/metrics.
+- Add focused integration/load drills if we want CI to prove retry, duplicate-send, expired-session, and anonymous-abuse scenarios automatically.
 
 ## Not Started Yet
 
-- Public share links, chat, and workspace-wide presence.
-- Production infrastructure, observability, search, queues, rate limiting, and deployment automation.
+- Dedicated external queue service, external search cluster, tracing backend, and deployment automation.
+- Folder-level sharing and link preview/media processing.

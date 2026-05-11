@@ -75,3 +75,37 @@
 
 7. Keep PostgreSQL as the document source of truth
 - Realtime updates flow through Yjs and Redis, but durable document content, CRDT snapshots, version history, permissions, audit events, and notifications remain in PostgreSQL.
+
+## 2026-05-11 Systems Showcase Update
+
+1. Reframe the project from MVP to senior backend showcase
+- WorkspaceOS should demonstrate system-design concepts directly: durable async work, idempotency, ordered chat, rate limiting, presence, metrics, and append-only feeds.
+
+2. Use transactional outbox before adding an external queue
+- PostgreSQL owns outbox events, jobs, and attempts so local development remains simple while preserving a queue-ready boundary.
+
+3. Keep chat ordering local to each channel
+- Chat messages use per-channel monotonic sequence numbers instead of a global Snowflake-style ID because ordering only needs to be stable inside a channel.
+
+4. Treat activity as the durable offline catch-up feed
+- Activity events are append-only and cursor-paginated, mapping news-feed/system-sync concepts into the current product.
+
+5. Prefer Redis for ephemeral distributed coordination
+- Redis backs rate limiting, workspace presence, typing indicators, and pub/sub fanout, while PostgreSQL remains the durable source of truth.
+
+## 2026-05-11 Systems Showcase Wave 2
+
+1. Model Drive sync with resumable sessions before adding a sync client
+- File bytes now support block upload, checksum dedupe, object composition, expiration, and cleanup. The product can still use simple signed uploads, but the backend exposes the more scalable storage model.
+
+2. Map URL-shortener concepts to public share links
+- Public links use short tokens, optional passwords, expiration, revocation, access counters, and anonymous rate limits instead of exposing raw resource IDs.
+
+3. Keep search Postgres-native until scale demands a new service
+- Full-text/prefix search plus query-popularity telemetry is enough for the current product. A dedicated indexer can be introduced later without changing the public API.
+
+4. Cache only hot authorization paths
+- Redis caches workspace membership and resource grants because those checks sit on most routes. Write paths invalidate explicitly and enqueue cache-invalidation jobs through the outbox.
+
+5. Prefer production-shaped observability over heavy tooling
+- Request IDs, structured JSON logs, latency metrics, queue metrics, upload-session status, and error envelopes are in place. External tracing/log aggregation remains a deployment concern.

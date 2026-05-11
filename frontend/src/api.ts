@@ -110,8 +110,7 @@ export type Notification = {
   recipientUserId: string
   actorUserId: string
   workspaceId: string | null
-  type: 'workspace_invite' | 'document_shared' | 'file_shared'
-    | 'document_updated'
+  type: 'workspace_invite' | 'document_shared' | 'file_shared' | 'document_updated' | 'chat_mention'
   entityType: string
   entityId: string
   title: string
@@ -119,6 +118,79 @@ export type Notification = {
   metadata: string | null
   readAt: string | null
   createdAt: string
+}
+
+export type ChatChannel = {
+  id: string
+  workspaceId: string
+  name: string
+  createdByUserId: string
+  archivedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type ChatMessage = {
+  id: string
+  workspaceId: string
+  channelId: string
+  senderUserId: string
+  clientMessageId: string
+  sequenceNumber: number
+  body: string
+  createdAt: string
+  editedAt: string | null
+  archivedAt: string | null
+  senderName: string
+  senderEmail: string
+}
+
+export type ActivityEvent = {
+  id: string
+  workspaceId: string
+  actorUserId: string | null
+  actorName: string | null
+  actorEmail: string | null
+  eventType: string
+  entityType: string
+  entityId: string
+  summary: string
+  metadata: string
+  createdAt: string
+}
+
+export type SearchResult = {
+  type: 'document' | 'file' | 'chat'
+  id: string
+  title: string
+  excerpt?: string
+  mimeType?: string
+  sizeBytes?: number
+  channelId?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export type SearchSuggestion = {
+  value: string
+  type: 'query' | 'document' | 'file'
+  count?: number
+}
+
+export type PublicShareLink = {
+  id: string
+  workspaceId: string
+  resourceType: 'document' | 'file'
+  resourceId: string
+  token: string
+  passwordHash: 'set' | null
+  expiresAt: string | null
+  revokedAt: string | null
+  accessCount: number
+  lastAccessedAt: string | null
+  createdByUserId: string
+  createdAt: string
+  updatedAt: string
 }
 
 export type FileVersion = {
@@ -147,6 +219,38 @@ export type UploadIntent = {
   uploadUrl: string
   expiresInSeconds: number
   maxUploadBytes: number
+}
+
+export type UploadSession = {
+  id: string
+  workspaceId: string
+  fileId: string
+  versionId: string
+  createdByUserId: string
+  fileName: string
+  mimeType: string
+  totalSizeBytes: number
+  blockSizeBytes: number
+  totalBlocks: number
+  uploadedBlocks: number
+  status: 'pending' | 'completed' | 'failed' | 'expired'
+  expiresAt: string
+  completedAt: string | null
+  lastError: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type UploadSessionBlock = {
+  id: string
+  sessionId: string
+  blockIndex: number
+  objectKey: string
+  checksum: string | null
+  sizeBytes: number | null
+  uploadedAt: string | null
+  createdAt: string
+  updatedAt: string
 }
 
 async function request<T>(path: string, options: RequestInit = {}) {
@@ -306,6 +410,61 @@ export function createFileUploadIntent(
   })
 }
 
+export function createFileUploadSession(
+  workspaceId: string,
+  input: {
+    name: string
+    folderId: string | null
+    mimeType: string
+    sizeBytes: number
+    checksum?: string | null
+    blockSizeBytes?: number
+  },
+) {
+  return request<{
+    file: DriveFile
+    version: FileVersion
+    session: UploadSession
+    expiresInSeconds: number
+    minComposableBlockBytes: number
+  }>(`/api/workspaces/${workspaceId}/files/upload-sessions`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function getUploadSession(workspaceId: string, sessionId: string) {
+  return request<{ session: UploadSession; blocks: UploadSessionBlock[] }>(
+    `/api/workspaces/${workspaceId}/files/upload-sessions/${sessionId}`,
+  )
+}
+
+export function createBlockUploadIntent(workspaceId: string, sessionId: string, blockIndex: number) {
+  return request<{ block: UploadSessionBlock; uploadUrl: string; expiresInSeconds: number }>(
+    `/api/workspaces/${workspaceId}/files/upload-sessions/${sessionId}/blocks/${blockIndex}/upload-intent`,
+    { method: 'POST' },
+  )
+}
+
+export function completeUploadBlock(
+  workspaceId: string,
+  sessionId: string,
+  blockIndex: number,
+  input: { checksum: string; sizeBytes: number },
+) {
+  return request<{ block: UploadSessionBlock; deduped: boolean; uploadedBlocks: number }>(
+    `/api/workspaces/${workspaceId}/files/upload-sessions/${sessionId}/blocks/${blockIndex}/complete`,
+    { method: 'POST', body: JSON.stringify(input) },
+  )
+}
+
+export function completeUploadSession(workspaceId: string, sessionId: string) {
+  return request<{ file: DriveFile; version: FileVersion; sessionId: string }>(
+    `/api/workspaces/${workspaceId}/files/upload-sessions/${sessionId}/complete`,
+    { method: 'POST' },
+  )
+}
+
 export function createReplacementUploadIntent(
   workspaceId: string,
   fileId: string,
@@ -386,5 +545,75 @@ export function markNotificationRead(notificationId: string) {
 export function markAllNotificationsRead() {
   return request<{ updatedCount: number }>('/api/notifications/mark-all-read', {
     method: 'POST',
+  })
+}
+
+export function getChatChannels(workspaceId: string) {
+  return request<{ channels: ChatChannel[] }>(`/api/workspaces/${workspaceId}/channels`)
+}
+
+export function createChatChannel(workspaceId: string, name: string) {
+  return request<{ channel: ChatChannel }>(`/api/workspaces/${workspaceId}/channels`, {
+    method: 'POST',
+    body: JSON.stringify({ name }),
+  })
+}
+
+export function getChatMessages(workspaceId: string, channelId: string, beforeSequence?: number | null) {
+  const params = new URLSearchParams({ limit: '50' })
+  if (beforeSequence) {
+    params.set('beforeSequence', String(beforeSequence))
+  }
+
+  return request<{ messages: ChatMessage[]; nextCursor: number | null }>(
+    `/api/workspaces/${workspaceId}/channels/${channelId}/messages?${params.toString()}`,
+  )
+}
+
+export function getWorkspaceActivity(workspaceId: string, cursor?: string | null) {
+  const params = new URLSearchParams({ limit: '50' })
+  if (cursor) {
+    params.set('cursor', cursor)
+  }
+
+  return request<{ activity: ActivityEvent[]; nextCursor: string | null }>(
+    `/api/workspaces/${workspaceId}/activity?${params.toString()}`,
+  )
+}
+
+export function searchWorkspace(workspaceId: string, query: string, type: 'all' | 'documents' | 'files' | 'chat' = 'all') {
+  const params = new URLSearchParams({ q: query, type, limit: '20' })
+  return request<{ query: string; results: SearchResult[] }>(`/api/workspaces/${workspaceId}/search?${params.toString()}`)
+}
+
+export function autocompleteWorkspace(workspaceId: string, query: string) {
+  const params = new URLSearchParams({ q: query, limit: '8' })
+  return request<{ suggestions: SearchSuggestion[] }>(`/api/workspaces/${workspaceId}/autocomplete?${params.toString()}`)
+}
+
+export function getPublicShareLinks(workspaceId: string, resourceType?: 'document' | 'file', resourceId?: string) {
+  const params = new URLSearchParams()
+  if (resourceType && resourceId) {
+    params.set('resourceType', resourceType)
+    params.set('resourceId', resourceId)
+  }
+
+  const query = params.toString()
+  return request<{ links: PublicShareLink[] }>(`/api/workspaces/${workspaceId}/share-links${query ? `?${query}` : ''}`)
+}
+
+export function createPublicShareLink(
+  workspaceId: string,
+  input: { resourceType: 'document' | 'file'; resourceId: string; password?: string | null; expiresAt?: string | null },
+) {
+  return request<{ link: PublicShareLink }>(`/api/workspaces/${workspaceId}/share-links`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function revokePublicShareLink(workspaceId: string, linkId: string) {
+  return request<{ link: PublicShareLink }>(`/api/workspaces/${workspaceId}/share-links/${linkId}`, {
+    method: 'DELETE',
   })
 }

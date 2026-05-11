@@ -8,9 +8,12 @@ import * as Y from 'yjs'
 import { auth } from './lib/auth.js'
 import { db } from './db/index.js'
 import { auditEvents, documentVersions, documents, notifications, resourcePermissions } from './db/schema.js'
-import { publishNotification } from './lib/notifications.js'
+import { createNotification } from './lib/notifications.js'
 import { redis, redisPublisher, redisSubscriber } from './lib/redis.js'
-import { requireResourcePermission, type ResourcePermissionLevel } from './lib/workspace-access.js'
+import { checkRateLimit } from './lib/rate-limit.js'
+import { createChatMessage, getVisibleChannel, normalizeMessageBody } from './lib/chat.js'
+import { appendActivity } from './lib/activity.js'
+import { requireResourcePermission, requireWorkspaceRole, type ResourcePermissionLevel } from './lib/workspace-access.js'
 
 type RealtimeUser = {
   id: string
@@ -23,6 +26,7 @@ type RealtimeSocket = WebSocket & {
   isAlive: boolean
   user: RealtimeUser
   rooms: Map<string, ResourcePermissionLevel>
+  workspaces: Set<string>
 }
 
 type DocumentRoom = {
@@ -42,6 +46,10 @@ type ClientMessage =
   | { type: 'document.update'; workspaceId: string; documentId: string; update: string }
   | { type: 'document.presence'; workspaceId: string; documentId: string }
   | { type: 'document.snapshot'; workspaceId: string; documentId: string; title: string }
+  | { type: 'workspace.join'; workspaceId: string }
+  | { type: 'workspace.leave'; workspaceId: string }
+  | { type: 'chat.typing'; workspaceId: string; channelId: string; isTyping: boolean }
+  | { type: 'chat.message.send'; workspaceId: string; channelId: string; clientMessageId: string; body: string }
   | { type: 'ping' }
 
 const documentRooms = new Map<string, DocumentRoom>()
@@ -53,6 +61,10 @@ function documentRoomKey(workspaceId: string, documentId: string) {
 
 function documentUpdateChannel(workspaceId: string, documentId: string) {
   return `${documentRoomKey(workspaceId, documentId)}:updates`
+}
+
+function workspaceEventsChannel(workspaceId: string) {
+  return `workspace:${workspaceId}:events`
 }
 
 function encodeUpdate(update: Uint8Array) {
@@ -110,14 +122,106 @@ function collaborators(room: DocumentRoom) {
 }
 
 async function allowRealtimePatch(userId: string, documentId: string) {
-  const key = `rate:document_patch:${userId}:${documentId}:${Math.floor(Date.now() / 1000)}`
-  const count = await redis.incr(key)
+  const result = await checkRateLimit(`${userId}:${documentId}`, {
+    keyPrefix: 'document_patch',
+    limit: 40,
+    windowSeconds: 1,
+  })
 
-  if (count === 1) {
-    await redis.expire(key, 2)
+  return result.allowed
+}
+
+async function allowChatSend(userId: string, channelId: string) {
+  const result = await checkRateLimit(`${userId}:${channelId}`, {
+    keyPrefix: 'chat_send',
+    limit: 60,
+    windowSeconds: 60,
+  })
+
+  return result.allowed
+}
+
+function broadcastWorkspace(workspaceId: string, payload: unknown) {
+  for (const sockets of userSockets.values()) {
+    for (const socket of sockets) {
+      if (socket.workspaces.has(workspaceId)) {
+        send(socket, payload)
+      }
+    }
+  }
+}
+
+async function workspacePresence(workspaceId: string) {
+  const keys = await redis.keys(`presence:workspace:${workspaceId}:*`)
+  if (!keys.length) {
+    return []
   }
 
-  return count <= 40
+  const values = await redis.mGet(keys)
+  const byUser = new Map<string, { userId: string; name: string; email: string; connectionCount: number }>()
+
+  for (const value of values) {
+    if (!value) {
+      continue
+    }
+
+    const parsed = JSON.parse(value) as { userId: string; name: string; email: string }
+    const existing = byUser.get(parsed.userId)
+
+    if (existing) {
+      existing.connectionCount += 1
+    } else {
+      byUser.set(parsed.userId, { ...parsed, connectionCount: 1 })
+    }
+  }
+
+  return Array.from(byUser.values()).sort((left, right) => left.email.localeCompare(right.email))
+}
+
+async function publishWorkspacePresence(workspaceId: string) {
+  await redisPublisher.publish(
+    workspaceEventsChannel(workspaceId),
+    JSON.stringify({ type: 'workspace.presence', workspaceId, members: await workspacePresence(workspaceId) }),
+  )
+}
+
+async function joinWorkspace(socket: RealtimeSocket, workspaceId: string) {
+  if (!validId(workspaceId)) {
+    send(socket, { type: 'error', error: 'Invalid workspace.' })
+    return
+  }
+
+  const access = await requireWorkspaceRole(socket.user.id, workspaceId)
+  if (!access.ok) {
+    send(socket, { type: 'error', error: access.error })
+    return
+  }
+
+  socket.workspaces.add(workspaceId)
+  await redis.setEx(
+    `presence:workspace:${workspaceId}:${socket.user.id}:${socket.connectionId}`,
+    45,
+    JSON.stringify({ userId: socket.user.id, name: socket.user.name, email: socket.user.email }),
+  )
+
+  send(socket, { type: 'workspace.presence', workspaceId, members: await workspacePresence(workspaceId) })
+  await publishWorkspacePresence(workspaceId)
+}
+
+async function leaveWorkspace(socket: RealtimeSocket, workspaceId: string) {
+  socket.workspaces.delete(workspaceId)
+  await redis.del(`presence:workspace:${workspaceId}:${socket.user.id}:${socket.connectionId}`)
+  await publishWorkspacePresence(workspaceId)
+}
+
+async function refreshWorkspacePresence(socket: RealtimeSocket) {
+  for (const workspaceId of socket.workspaces) {
+    await redis.setEx(
+      `presence:workspace:${workspaceId}:${socket.user.id}:${socket.connectionId}`,
+      45,
+      JSON.stringify({ userId: socket.user.id, name: socket.user.name, email: socket.user.email }),
+    )
+  }
 }
 
 async function loadDocumentRoom(workspaceId: string, documentId: string) {
@@ -264,30 +368,36 @@ async function persistDocumentState(room: DocumentRoom, editorUserId: string | n
     const savedNotifications: Array<typeof notifications.$inferSelect> = []
 
     for (const recipientUserId of recipientIds) {
-      const rows = await tx
-        .insert(notifications)
-        .values({
-          recipientUserId,
-          actorUserId: editorUserId,
-          workspaceId: room.workspaceId,
-          type: 'document_updated',
-          entityType: 'document',
-          entityId: room.documentId,
-          title: 'Document updated',
-          body: `A shared document was updated: ${document.title}`,
-          metadata: JSON.stringify({ documentId: room.documentId, title: document.title, versionNumber }),
-          dedupeKey: `document_updated:${room.documentId}:${recipientUserId}:${versionNumber}`,
-        })
-        .onConflictDoNothing()
-        .returning()
+      const notification = await createNotification(tx, {
+        recipientUserId,
+        actorUserId: editorUserId,
+        workspaceId: room.workspaceId,
+        type: 'document_updated',
+        entityType: 'document',
+        entityId: room.documentId,
+        title: 'Document updated',
+        body: `A shared document was updated: ${document.title}`,
+        metadata: { documentId: room.documentId, title: document.title, versionNumber },
+        dedupeKey: `document_updated:${room.documentId}:${recipientUserId}:${versionNumber}`,
+      })
 
-      savedNotifications.push(...rows)
+      if (notification) {
+        savedNotifications.push(notification)
+      }
     }
+
+    await appendActivity(tx, {
+      workspaceId: room.workspaceId,
+      actorUserId: editorUserId,
+      eventType: 'document.realtime_snapshot_saved',
+      entityType: 'document',
+      entityId: room.documentId,
+      summary: `Document "${document.title}" was saved from realtime editing`,
+      metadata: { documentId: room.documentId, versionNumber },
+    })
 
     return { document, versionNumber, notifications: savedNotifications }
   })
-
-  await Promise.all(result.notifications.map((notification) => publishNotification(notification)))
 
   return result
 }
@@ -439,6 +549,7 @@ function untrackSocket(socket: RealtimeSocket) {
 
 async function closeSocket(socket: RealtimeSocket) {
   const joinedRooms = Array.from(socket.rooms.keys())
+  const joinedWorkspaces = Array.from(socket.workspaces)
 
   for (const key of joinedRooms) {
     const room = documentRooms.get(key)
@@ -448,7 +559,102 @@ async function closeSocket(socket: RealtimeSocket) {
     }
   }
 
+  for (const workspaceId of joinedWorkspaces) {
+    await leaveWorkspace(socket, workspaceId)
+  }
+
   untrackSocket(socket)
+}
+
+async function handleChatTyping(socket: RealtimeSocket, message: Extract<ClientMessage, { type: 'chat.typing' }>) {
+  if (!socket.workspaces.has(message.workspaceId)) {
+    send(socket, { type: 'error', error: 'Join the workspace before sending typing events.' })
+    return
+  }
+
+  const channel = await getVisibleChannel(message.workspaceId, message.channelId)
+  if (!channel) {
+    send(socket, { type: 'error', error: 'Channel not found' })
+    return
+  }
+
+  await redisPublisher.publish(
+    workspaceEventsChannel(message.workspaceId),
+    JSON.stringify({
+      type: 'chat.typing',
+      workspaceId: message.workspaceId,
+      channelId: message.channelId,
+      userId: socket.user.id,
+      name: socket.user.name,
+      email: socket.user.email,
+      isTyping: Boolean(message.isTyping),
+    }),
+  )
+}
+
+async function handleChatMessage(socket: RealtimeSocket, message: Extract<ClientMessage, { type: 'chat.message.send' }>) {
+  if (!socket.workspaces.has(message.workspaceId)) {
+    send(socket, { type: 'error', error: 'Join the workspace before sending messages.' })
+    return
+  }
+
+  if (!(await allowChatSend(socket.user.id, message.channelId))) {
+    send(socket, { type: 'error', error: 'Chat send rate limit exceeded. Slow down and retry shortly.' })
+    return
+  }
+
+  const body = normalizeMessageBody(message.body)
+  const clientMessageId = typeof message.clientMessageId === 'string' ? message.clientMessageId.trim() : ''
+
+  if (body.length < 1 || body.length > 4000) {
+    send(socket, { type: 'error', error: 'Message must be between 1 and 4000 characters.' })
+    return
+  }
+
+  if (clientMessageId.length < 8 || clientMessageId.length > 120) {
+    send(socket, { type: 'error', error: 'Message idempotency key is invalid.' })
+    return
+  }
+
+  const channel = await getVisibleChannel(message.workspaceId, message.channelId)
+  if (!channel) {
+    send(socket, { type: 'error', error: 'Channel not found' })
+    return
+  }
+
+  const created = await createChatMessage({
+    workspaceId: message.workspaceId,
+    channelId: message.channelId,
+    senderUserId: socket.user.id,
+    clientMessageId,
+    body,
+  })
+
+  if (!created) {
+    send(socket, { type: 'error', error: 'Could not save chat message.' })
+    return
+  }
+
+  send(socket, {
+    type: 'chat.message.ack',
+    workspaceId: message.workspaceId,
+    channelId: message.channelId,
+    clientMessageId,
+    message: created.message,
+    duplicate: !created.created,
+  })
+
+  if (created.created) {
+    await redisPublisher.publish(
+      workspaceEventsChannel(message.workspaceId),
+      JSON.stringify({
+        type: 'chat.message.created',
+        workspaceId: message.workspaceId,
+        channelId: message.channelId,
+        message: created.message,
+      }),
+    )
+  }
 }
 
 async function handleSocketMessage(socket: RealtimeSocket, message: ClientMessage | null) {
@@ -458,7 +664,18 @@ async function handleSocketMessage(socket: RealtimeSocket, message: ClientMessag
   }
 
   if (message.type === 'ping') {
+    await refreshWorkspacePresence(socket)
     send(socket, { type: 'pong' })
+    return
+  }
+
+  if (message.type === 'workspace.join') {
+    await joinWorkspace(socket, message.workspaceId)
+    return
+  }
+
+  if (message.type === 'workspace.leave') {
+    await leaveWorkspace(socket, message.workspaceId)
     return
   }
 
@@ -493,6 +710,16 @@ async function handleSocketMessage(socket: RealtimeSocket, message: ClientMessag
 
   if (message.type === 'document.snapshot') {
     await handleDocumentSnapshot(socket, message)
+    return
+  }
+
+  if (message.type === 'chat.typing') {
+    await handleChatTyping(socket, message)
+    return
+  }
+
+  if (message.type === 'chat.message.send') {
+    await handleChatMessage(socket, message)
   }
 }
 
@@ -543,6 +770,11 @@ export async function setupRealtimeServer(server: Server) {
     }
   })
 
+  await redisSubscriber.pSubscribe('workspace:*:events', (message, channel) => {
+    const [, workspaceId] = channel.split(':')
+    broadcastWorkspace(workspaceId, JSON.parse(message))
+  })
+
   server.on('upgrade', (request, socket, head) => {
     const pathname = request.url ? new URL(request.url, 'http://localhost').pathname : ''
 
@@ -577,6 +809,7 @@ export async function setupRealtimeServer(server: Server) {
     socket.isAlive = true
     socket.user = user
     socket.rooms = new Map()
+    socket.workspaces = new Set()
     trackSocket(socket)
 
     socket.on('pong', () => {

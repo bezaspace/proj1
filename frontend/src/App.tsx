@@ -6,6 +6,7 @@ import {
   archiveFile,
   archiveFolder,
   completeFileUpload,
+  createChatChannel,
   createDocument,
   createFileUploadIntent,
   createFolder,
@@ -15,6 +16,8 @@ import {
   getDocumentPermissions,
   getDocumentVersions,
   getDocuments,
+  getChatChannels,
+  getChatMessages,
   getDriveItems,
   getFileDownload,
   getFilePermissions,
@@ -26,6 +29,7 @@ import {
   getWorkspaces,
   getWorkspaceInvites,
   getWorkspaceMembers,
+  getWorkspaceActivity,
   markAllNotificationsRead,
   markNotificationRead,
   renameFolder,
@@ -41,6 +45,9 @@ import {
   type DriveFile,
   type FileVersion,
   type Folder,
+  type ActivityEvent,
+  type ChatChannel,
+  type ChatMessage,
   type Notification,
   type ResourceGrant,
   type ResourcePermissionLevel,
@@ -52,11 +59,13 @@ import {
 import { signIn, signOut, signUp, useSession } from './auth-client'
 
 type AuthMode = 'signup' | 'login'
-type AppView = 'documents' | 'files' | 'people'
+type AppView = 'documents' | 'files' | 'chat' | 'activity' | 'people'
 type SaveStatus = 'idle' | 'dirty' | 'saving' | 'saved' | 'live'
 type FolderCrumb = { id: string | null; name: string }
 type RealtimeStatus = 'disconnected' | 'connecting' | 'connected'
 type Collaborator = { userId: string; name: string; email: string; connectionCount: number }
+type OnlineMember = Collaborator
+type TypingMember = { userId: string; name: string; email: string }
 
 type RealtimeMessage =
   | { type: 'ready' }
@@ -71,6 +80,25 @@ type RealtimeMessage =
     }
   | { type: 'document.update'; workspaceId: string; documentId: string; update: string; userId: string | null }
   | { type: 'document.presence'; workspaceId: string; documentId: string; collaborators: Collaborator[] }
+  | { type: 'workspace.presence'; workspaceId: string; members: OnlineMember[] }
+  | {
+      type: 'chat.message.ack'
+      workspaceId: string
+      channelId: string
+      clientMessageId: string
+      message: ChatMessage
+      duplicate: boolean
+    }
+  | { type: 'chat.message.created'; workspaceId: string; channelId: string; message: ChatMessage }
+  | {
+      type: 'chat.typing'
+      workspaceId: string
+      channelId: string
+      userId: string
+      name: string
+      email: string
+      isTyping: boolean
+    }
   | {
       type: 'document.snapshot.saved'
       workspaceId: string
@@ -195,11 +223,26 @@ function App() {
   const [showNotifications, setShowNotifications] = useState(false)
   const [realtimeStatus, setRealtimeStatus] = useState<RealtimeStatus>('disconnected')
   const [collaborators, setCollaborators] = useState<Collaborator[]>([])
+  const [onlineMembers, setOnlineMembers] = useState<OnlineMember[]>([])
+  const [chatChannels, setChatChannels] = useState<ChatChannel[]>([])
+  const [selectedChannelId, setSelectedChannelId] = useState<string | null>(null)
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([])
+  const [chatDraft, setChatDraft] = useState('')
+  const [newChannelName, setNewChannelName] = useState('')
+  const [chatError, setChatError] = useState('')
+  const [isCreatingChannel, setIsCreatingChannel] = useState(false)
+  const [nextMessageCursor, setNextMessageCursor] = useState<number | null>(null)
+  const [typingMembers, setTypingMembers] = useState<TypingMember[]>([])
+  const [activityEvents, setActivityEvents] = useState<ActivityEvent[]>([])
+  const [nextActivityCursor, setNextActivityCursor] = useState<string | null>(null)
+  const [activityError, setActivityError] = useState('')
   const [liveDocumentPermission, setLiveDocumentPermission] = useState<ResourcePermissionLevel | null>(null)
   const [isRealtimeRoomLoading, setIsRealtimeRoomLoading] = useState(false)
   const realtimeSocketRef = useRef<WebSocket | null>(null)
   const reconnectTimerRef = useRef<number | null>(null)
   const reconnectAttemptRef = useRef(0)
+  const activeWorkspaceRef = useRef<string | null>(null)
+  const typingTimerRef = useRef<number | null>(null)
   const ydocRef = useRef<Y.Doc | null>(null)
   const ytextRef = useRef<Y.Text | null>(null)
   const activeRoomRef = useRef<{ workspaceId: string; documentId: string } | null>(null)
@@ -219,6 +262,10 @@ function App() {
   const selectedFile = useMemo(
     () => driveFiles.find((file) => file.id === selectedFileId) ?? driveFiles[0],
     [selectedFileId, driveFiles],
+  )
+  const selectedChannel = useMemo(
+    () => chatChannels.find((channel) => channel.id === selectedChannelId) ?? chatChannels[0],
+    [selectedChannelId, chatChannels],
   )
   const currentFolderId = folderStack[folderStack.length - 1]?.id ?? null
   const canEditResources =
@@ -299,6 +346,30 @@ function App() {
     setUnreadCount(countPayload.unreadCount)
   }
 
+  async function loadChatChannels(workspaceId: string) {
+    const payload = await getChatChannels(workspaceId)
+    setChatChannels(payload.channels)
+    setSelectedChannelId((currentId) => {
+      if (currentId && payload.channels.some((channel) => channel.id === currentId)) {
+        return currentId
+      }
+
+      return payload.channels[0]?.id ?? null
+    })
+  }
+
+  async function loadChatMessages(workspaceId: string, channelId: string, beforeSequence?: number | null) {
+    const payload = await getChatMessages(workspaceId, channelId, beforeSequence)
+    setChatMessages((current) => (beforeSequence ? [...payload.messages, ...current] : payload.messages))
+    setNextMessageCursor(payload.nextCursor)
+  }
+
+  async function loadActivity(workspaceId: string, cursor?: string | null) {
+    const payload = await getWorkspaceActivity(workspaceId, cursor)
+    setActivityEvents((current) => (cursor ? [...current, ...payload.activity] : payload.activity))
+    setNextActivityCursor(payload.nextCursor)
+  }
+
   function sendRealtime(payload: unknown) {
     const socket = realtimeSocketRef.current
 
@@ -318,6 +389,23 @@ function App() {
     setIsRealtimeRoomLoading(true)
     activeRoomRef.current = { workspaceId: selectedWorkspace.id, documentId: selectedDocument.id }
     sendRealtime({ type: 'document.join', workspaceId: selectedWorkspace.id, documentId: selectedDocument.id })
+  }
+
+  function joinActiveWorkspace() {
+    if (!selectedWorkspace?.id || realtimeSocketRef.current?.readyState !== WebSocket.OPEN) {
+      return
+    }
+
+    if (activeWorkspaceRef.current === selectedWorkspace.id) {
+      return
+    }
+
+    if (activeWorkspaceRef.current) {
+      sendRealtime({ type: 'workspace.leave', workspaceId: activeWorkspaceRef.current })
+    }
+
+    activeWorkspaceRef.current = selectedWorkspace.id
+    sendRealtime({ type: 'workspace.join', workspaceId: selectedWorkspace.id })
   }
 
   function setupYjsDocument(initialContent: string) {
@@ -378,6 +466,7 @@ function App() {
     if (message.type === 'ready') {
       setRealtimeStatus('connected')
       reconnectAttemptRef.current = 0
+      joinActiveWorkspace()
       joinActiveDocument()
       return
     }
@@ -390,6 +479,44 @@ function App() {
     if (message.type === 'notification.created') {
       setNotifications((current) => [message.notification, ...current.filter((item) => item.id !== message.notification.id)])
       setUnreadCount(message.unreadCount)
+      return
+    }
+
+    if (message.type === 'workspace.presence') {
+      if (message.workspaceId === selectedWorkspace?.id) {
+        setOnlineMembers(message.members)
+      }
+      return
+    }
+
+    if (message.type === 'chat.message.ack' || message.type === 'chat.message.created') {
+      if (message.workspaceId !== selectedWorkspace?.id || message.channelId !== selectedChannel?.id) {
+        return
+      }
+
+      setChatMessages((current) => {
+        if (current.some((item) => item.id === message.message.id)) {
+          return current.map((item) => (item.id === message.message.id ? message.message : item))
+        }
+
+        return [...current, message.message].sort((left, right) => left.sequenceNumber - right.sequenceNumber)
+      })
+      return
+    }
+
+    if (message.type === 'chat.typing') {
+      if (message.workspaceId !== selectedWorkspace?.id || message.channelId !== selectedChannel?.id) {
+        return
+      }
+
+      if (message.userId === session.data?.user.id) {
+        return
+      }
+
+      setTypingMembers((current) => {
+        const remaining = current.filter((member) => member.userId !== message.userId)
+        return message.isTyping ? [...remaining, { userId: message.userId, name: message.name, email: message.email }] : remaining
+      })
       return
     }
 
@@ -506,6 +633,7 @@ function App() {
       ydocRef.current = null
       ytextRef.current = null
       activeRoomRef.current = null
+      activeWorkspaceRef.current = null
       setRealtimeStatus('disconnected')
       setWorkspaces([])
       setSelectedWorkspaceId(null)
@@ -520,6 +648,10 @@ function App() {
       setNotifications([])
       setUnreadCount(0)
       setCollaborators([])
+      setOnlineMembers([])
+      setChatChannels([])
+      setChatMessages([])
+      setActivityEvents([])
       return
     }
 
@@ -536,6 +668,17 @@ function App() {
     setSelectedFileId(null)
     setMembers([])
     setWorkspaceInvites([])
+    setChatChannels([])
+    setSelectedChannelId(null)
+    setChatMessages([])
+    setOnlineMembers([])
+    setActivityEvents([])
+    setNextActivityCursor(null)
+    if (activeWorkspaceRef.current && activeWorkspaceRef.current !== selectedWorkspace?.id) {
+      sendRealtime({ type: 'workspace.leave', workspaceId: activeWorkspaceRef.current })
+      activeWorkspaceRef.current = null
+    }
+    joinActiveWorkspace()
   }, [selectedWorkspace?.id])
 
   useEffect(() => {
@@ -618,6 +761,40 @@ function App() {
       setFileError(error instanceof Error ? error.message : 'Could not load files')
     })
   }, [appView, selectedWorkspace?.id, currentFolderId])
+
+  useEffect(() => {
+    if (appView !== 'chat' || !selectedWorkspace?.id) {
+      return
+    }
+
+    setChatError('')
+    loadChatChannels(selectedWorkspace.id).catch((error) => {
+      setChatError(error instanceof Error ? error.message : 'Could not load channels')
+    })
+  }, [appView, selectedWorkspace?.id])
+
+  useEffect(() => {
+    if (appView !== 'chat' || !selectedWorkspace?.id || !selectedChannel?.id) {
+      setChatMessages([])
+      setTypingMembers([])
+      return
+    }
+
+    loadChatMessages(selectedWorkspace.id, selectedChannel.id).catch((error) => {
+      setChatError(error instanceof Error ? error.message : 'Could not load messages')
+    })
+  }, [appView, selectedWorkspace?.id, selectedChannel?.id])
+
+  useEffect(() => {
+    if (appView !== 'activity' || !selectedWorkspace?.id) {
+      return
+    }
+
+    setActivityError('')
+    loadActivity(selectedWorkspace.id).catch((error) => {
+      setActivityError(error instanceof Error ? error.message : 'Could not load activity')
+    })
+  }, [appView, selectedWorkspace?.id])
 
   useEffect(() => {
     if (appView !== 'files' || !selectedWorkspace?.id || !selectedFile?.id) {
@@ -1069,6 +1246,87 @@ function App() {
     }
   }
 
+  async function handleCreateChannel(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedWorkspace) {
+      return
+    }
+
+    setChatError('')
+    setIsCreatingChannel(true)
+
+    try {
+      const payload = await createChatChannel(selectedWorkspace.id, newChannelName)
+      setChatChannels((current) => [payload.channel, ...current])
+      setSelectedChannelId(payload.channel.id)
+      setNewChannelName('')
+      if (appView === 'activity') {
+        await loadActivity(selectedWorkspace.id)
+      }
+    } catch (error) {
+      setChatError(error instanceof Error ? error.message : 'Could not create channel')
+    } finally {
+      setIsCreatingChannel(false)
+    }
+  }
+
+  function handleChatDraft(value: string) {
+    setChatDraft(value)
+
+    if (!selectedWorkspace || !selectedChannel) {
+      return
+    }
+
+    sendRealtime({
+      type: 'chat.typing',
+      workspaceId: selectedWorkspace.id,
+      channelId: selectedChannel.id,
+      isTyping: Boolean(value.trim()),
+    })
+
+    if (typingTimerRef.current) {
+      window.clearTimeout(typingTimerRef.current)
+    }
+
+    typingTimerRef.current = window.setTimeout(() => {
+      sendRealtime({
+        type: 'chat.typing',
+        workspaceId: selectedWorkspace.id,
+        channelId: selectedChannel.id,
+        isTyping: false,
+      })
+    }, 1500)
+  }
+
+  function handleSendChatMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedWorkspace || !selectedChannel || !chatDraft.trim()) {
+      return
+    }
+
+    const body = chatDraft.trim()
+    const clientMessageId =
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+    setChatError('')
+    setChatDraft('')
+    sendRealtime({
+      type: 'chat.message.send',
+      workspaceId: selectedWorkspace.id,
+      channelId: selectedChannel.id,
+      clientMessageId,
+      body,
+    })
+    sendRealtime({
+      type: 'chat.typing',
+      workspaceId: selectedWorkspace.id,
+      channelId: selectedChannel.id,
+      isTyping: false,
+    })
+  }
+
   if (session.isPending) {
     return (
       <main className="shell center">
@@ -1204,6 +1462,12 @@ function App() {
                 </button>
                 <button type="button" className={appView === 'files' ? 'active' : ''} onClick={() => setAppView('files')}>
                   Files
+                </button>
+                <button type="button" className={appView === 'chat' ? 'active' : ''} onClick={() => setAppView('chat')}>
+                  Chat
+                </button>
+                <button type="button" className={appView === 'activity' ? 'active' : ''} onClick={() => setAppView('activity')}>
+                  Activity
                 </button>
                 <button type="button" className={appView === 'people' ? 'active' : ''} onClick={() => setAppView('people')}>
                   People
@@ -1619,6 +1883,137 @@ function App() {
                       )}
                     </aside>
                   </div>
+                </div>
+              ) : appView === 'chat' ? (
+                <div className="chat-view">
+                  <div className="documents-header">
+                    <div>
+                      <p className="eyebrow">{realtimeStatus}</p>
+                      <h2>Chat</h2>
+                    </div>
+                    <div className="presence-strip">
+                      {onlineMembers.map((member) => (
+                        <span title={member.email} key={member.userId}>
+                          {member.name.slice(0, 1).toUpperCase()}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+
+                  {chatError ? <p className="error">{chatError}</p> : null}
+
+                  <div className="chat-grid">
+                    <aside className="chat-sidebar">
+                      <form className="inline-form" onSubmit={handleCreateChannel}>
+                        <input
+                          value={newChannelName}
+                          onChange={(event) => setNewChannelName(event.target.value)}
+                          placeholder="channel-name"
+                          maxLength={60}
+                          disabled={!canEditResources}
+                          required
+                        />
+                        <button type="submit" disabled={!canEditResources || isCreatingChannel}>
+                          {isCreatingChannel ? 'Creating...' : 'Create'}
+                        </button>
+                      </form>
+                      <div className="channel-list">
+                        {chatChannels.map((channel) => (
+                          <button
+                            type="button"
+                            className={channel.id === selectedChannel?.id ? 'channel-item active' : 'channel-item'}
+                            key={channel.id}
+                            onClick={() => setSelectedChannelId(channel.id)}
+                          >
+                            #{channel.name}
+                          </button>
+                        ))}
+                      </div>
+                    </aside>
+
+                    <section className="chat-panel">
+                      {selectedChannel ? (
+                        <>
+                          <div className="panel-heading">
+                            <h3>#{selectedChannel.name}</h3>
+                            {nextMessageCursor ? (
+                              <button
+                                type="button"
+                                className="secondary compact"
+                                onClick={() => selectedWorkspace && loadChatMessages(selectedWorkspace.id, selectedChannel.id, nextMessageCursor)}
+                              >
+                                Load older
+                              </button>
+                            ) : null}
+                          </div>
+                          <div className="message-list">
+                            {chatMessages.map((message) => (
+                              <article className="message-row" key={message.id}>
+                                <div>
+                                  <strong>{message.senderName}</strong>
+                                  <small>
+                                    #{message.sequenceNumber} · {new Date(message.createdAt).toLocaleString()}
+                                  </small>
+                                </div>
+                                <p>{message.body}</p>
+                              </article>
+                            ))}
+                            {!chatMessages.length ? <p className="muted">No messages yet.</p> : null}
+                          </div>
+                          <p className="typing-line">
+                            {typingMembers.length ? `${typingMembers.map((member) => member.name).join(', ')} typing...` : ''}
+                          </p>
+                          <form className="message-form" onSubmit={handleSendChatMessage}>
+                            <input
+                              value={chatDraft}
+                              onChange={(event) => handleChatDraft(event.target.value)}
+                              placeholder="Message the workspace. Mention people with @name or @email."
+                              maxLength={4000}
+                            />
+                            <button type="submit" disabled={!chatDraft.trim()}>
+                              Send
+                            </button>
+                          </form>
+                        </>
+                      ) : (
+                        <p className="muted">Create or select a channel to start messaging.</p>
+                      )}
+                    </section>
+                  </div>
+                </div>
+              ) : appView === 'activity' ? (
+                <div className="activity-view">
+                  <div className="documents-header">
+                    <div>
+                      <p className="eyebrow">Append-only feed</p>
+                      <h2>Activity</h2>
+                    </div>
+                    <button type="button" className="secondary" onClick={() => selectedWorkspace && loadActivity(selectedWorkspace.id)}>
+                      Refresh
+                    </button>
+                  </div>
+
+                  {activityError ? <p className="error">{activityError}</p> : null}
+
+                  <div className="activity-list">
+                    {activityEvents.map((event) => (
+                      <article className="activity-row" key={event.id}>
+                        <div>
+                          <strong>{event.summary}</strong>
+                          <small>
+                            {event.actorName ?? 'System'} · {event.eventType} · {new Date(event.createdAt).toLocaleString()}
+                          </small>
+                        </div>
+                      </article>
+                    ))}
+                    {!activityEvents.length ? <p className="muted">No activity yet.</p> : null}
+                  </div>
+
+                  {nextActivityCursor ? (
+                    <button type="button" className="secondary" onClick={() => selectedWorkspace && loadActivity(selectedWorkspace.id, nextActivityCursor)}>
+                      Load older activity
+                    </button>
+                  ) : null}
                 </div>
               ) : (
                 <div className="people-view">

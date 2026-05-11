@@ -1,7 +1,10 @@
 import { and, eq, isNull } from 'drizzle-orm'
 import { db } from '../db/index.js'
-import { notifications } from '../db/schema.js'
+import { notificationDeliveries, notifications } from '../db/schema.js'
+import { enqueueOutboxEvent } from './outbox.js'
 import { redisPublisher } from './redis.js'
+
+type DbExecutor = Pick<typeof db, 'insert'>
 
 export function notificationFields() {
   return {
@@ -21,6 +24,19 @@ export function notificationFields() {
 }
 
 export type NotificationRow = typeof notifications.$inferSelect
+
+export type CreateNotificationInput = {
+  recipientUserId: string
+  actorUserId: string
+  workspaceId?: string | null
+  type: typeof notifications.$inferInsert.type
+  entityType: string
+  entityId: string
+  title: string
+  body: string
+  metadata?: unknown
+  dedupeKey: string
+}
 
 export async function getUnreadNotificationCount(userId: string) {
   const rows = await db
@@ -44,3 +60,47 @@ export async function publishNotification(notification: NotificationRow) {
   )
 }
 
+export async function createNotification(executor: DbExecutor, input: CreateNotificationInput) {
+  const [notification] = await executor
+    .insert(notifications)
+    .values({
+      recipientUserId: input.recipientUserId,
+      actorUserId: input.actorUserId,
+      workspaceId: input.workspaceId ?? null,
+      type: input.type,
+      entityType: input.entityType,
+      entityId: input.entityId,
+      title: input.title,
+      body: input.body,
+      metadata: JSON.stringify(input.metadata ?? {}),
+      dedupeKey: input.dedupeKey,
+    })
+    .onConflictDoNothing()
+    .returning()
+
+  if (!notification) {
+    return null
+  }
+
+  await executor
+    .insert(notificationDeliveries)
+    .values({
+      notificationId: notification.id,
+      channel: 'realtime',
+      status: 'pending',
+    })
+    .onConflictDoNothing()
+
+  await enqueueOutboxEvent(executor, {
+    eventType: 'notification.created',
+    aggregateType: 'notification',
+    aggregateId: notification.id,
+    workspaceId: notification.workspaceId,
+    actorUserId: notification.actorUserId,
+    payload: { notificationId: notification.id, channel: 'realtime' },
+    idempotencyKey: `notification:${notification.id}:realtime`,
+    jobType: 'notification.deliver.realtime',
+  })
+
+  return notification
+}

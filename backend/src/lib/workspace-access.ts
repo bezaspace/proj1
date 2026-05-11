@@ -1,6 +1,7 @@
 import { and, eq } from 'drizzle-orm'
 import { db } from '../db/index.js'
 import { resourcePermissions, workspaceMembers } from '../db/schema.js'
+import { cacheKeys, getCachedJson, setCachedJson } from './cache.js'
 
 export type WorkspaceRole = 'owner' | 'admin' | 'member' | 'viewer'
 export type ResourceType = 'document' | 'file'
@@ -20,6 +21,18 @@ const permissionRank: Record<ResourcePermissionLevel, number> = {
 }
 
 export async function getWorkspaceMembership(userId: string, workspaceId: string) {
+  const cacheKey = cacheKeys.membership(workspaceId, userId)
+  const cached = await getCachedJson<{
+    id: string
+    workspaceId: string
+    userId: string
+    role: WorkspaceRole
+  } | null>(cacheKey)
+
+  if (cached !== null) {
+    return cached
+  }
+
   const [membership] = await db
     .select({
       id: workspaceMembers.id,
@@ -30,6 +43,10 @@ export async function getWorkspaceMembership(userId: string, workspaceId: string
     .from(workspaceMembers)
     .where(and(eq(workspaceMembers.userId, userId), eq(workspaceMembers.workspaceId, workspaceId)))
     .limit(1)
+
+  if (membership) {
+    await setCachedJson(cacheKey, membership)
+  }
 
   return membership ?? null
 }
@@ -62,6 +79,29 @@ export async function getResourceGrant(
   resourceType: ResourceType,
   resourceId: string,
 ) {
+  const cacheKey = cacheKeys.resourceGrant(workspaceId, resourceType, resourceId, userId)
+  const cached = await getCachedJson<{
+    id: string
+    workspaceId: string
+    resourceType: ResourceType
+    resourceId: string
+    userId: string
+    level: ResourcePermissionLevel
+    grantedByUserId: string
+    createdAt: string
+    updatedAt: string
+  } | null>(cacheKey)
+
+  if (cached !== null) {
+    return cached
+      ? {
+          ...cached,
+          createdAt: new Date(cached.createdAt),
+          updatedAt: new Date(cached.updatedAt),
+        }
+      : null
+  }
+
   const [grant] = await db
     .select({
       id: resourcePermissions.id,
@@ -84,6 +124,10 @@ export async function getResourceGrant(
       ),
     )
     .limit(1)
+
+  if (grant) {
+    await setCachedJson(cacheKey, grant)
+  }
 
   return grant ?? null
 }
