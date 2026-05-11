@@ -1,8 +1,23 @@
-import { relations } from 'drizzle-orm'
+import { relations, sql } from 'drizzle-orm'
 import { index, integer, pgEnum, pgTable, text, timestamp, uniqueIndex, uuid } from 'drizzle-orm/pg-core'
 
 export const workspaceRole = pgEnum('workspace_role', ['owner', 'admin', 'member', 'viewer'])
 export const fileUploadStatus = pgEnum('file_upload_status', ['pending', 'uploaded', 'failed'])
+export const workspaceInviteStatus = pgEnum('workspace_invite_status', ['pending', 'accepted', 'revoked', 'expired'])
+export const resourceType = pgEnum('resource_type', ['document', 'file'])
+export const resourcePermissionLevel = pgEnum('resource_permission_level', ['view', 'edit', 'owner'])
+export const notificationType = pgEnum('notification_type', [
+  'workspace_invite',
+  'document_shared',
+  'file_shared',
+  'document_updated',
+])
+
+export const users = pgTable('user', {
+  id: text('id').primaryKey(),
+  name: text('name').notNull(),
+  email: text('email').notNull(),
+})
 
 export const workspaces = pgTable('workspaces', {
   id: uuid('id').defaultRandom().primaryKey(),
@@ -46,6 +61,84 @@ export const auditEvents = pgTable(
   }),
 )
 
+export const workspaceInvites = pgTable(
+  'workspace_invites',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    email: text('email').notNull(),
+    role: workspaceRole('role').notNull().default('viewer'),
+    status: workspaceInviteStatus('status').notNull().default('pending'),
+    invitedByUserId: text('invited_by_user_id').notNull(),
+    acceptedByUserId: text('accepted_by_user_id'),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    acceptedAt: timestamp('accepted_at', { withTimezone: true }),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    workspaceStatusIdx: index('workspace_invites_workspace_status_idx').on(table.workspaceId, table.status),
+    emailStatusIdx: index('workspace_invites_email_status_idx').on(table.email, table.status),
+    pendingEmailIdx: uniqueIndex('workspace_invites_pending_email_idx')
+      .on(table.workspaceId, sql`lower(${table.email})`)
+      .where(sql`${table.status} = 'pending'`),
+  }),
+)
+
+export const resourcePermissions = pgTable(
+  'resource_permissions',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    workspaceId: uuid('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    resourceType: resourceType('resource_type').notNull(),
+    resourceId: uuid('resource_id').notNull(),
+    userId: text('user_id').notNull(),
+    level: resourcePermissionLevel('level').notNull(),
+    grantedByUserId: text('granted_by_user_id').notNull(),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    resourceUserIdx: uniqueIndex('resource_permissions_resource_user_idx').on(
+      table.workspaceId,
+      table.resourceType,
+      table.resourceId,
+      table.userId,
+    ),
+    userIdx: index('resource_permissions_user_idx').on(table.userId),
+    resourceIdx: index('resource_permissions_resource_idx').on(table.workspaceId, table.resourceType, table.resourceId),
+  }),
+)
+
+export const notifications = pgTable(
+  'notifications',
+  {
+    id: uuid('id').defaultRandom().primaryKey(),
+    recipientUserId: text('recipient_user_id').notNull(),
+    actorUserId: text('actor_user_id').notNull(),
+    workspaceId: uuid('workspace_id').references(() => workspaces.id, { onDelete: 'cascade' }),
+    type: notificationType('type').notNull(),
+    entityType: text('entity_type').notNull(),
+    entityId: text('entity_id').notNull(),
+    title: text('title').notNull(),
+    body: text('body').notNull(),
+    metadata: text('metadata'),
+    dedupeKey: text('dedupe_key').notNull(),
+    readAt: timestamp('read_at', { withTimezone: true }),
+    createdAt: timestamp('created_at', { withTimezone: true }).defaultNow().notNull(),
+  },
+  (table) => ({
+    recipientCreatedIdx: index('notifications_recipient_created_idx').on(table.recipientUserId, table.createdAt),
+    unreadIdx: index('notifications_unread_idx').on(table.recipientUserId, table.readAt),
+    dedupeIdx: uniqueIndex('notifications_dedupe_idx').on(table.dedupeKey),
+  }),
+)
+
 export const documents = pgTable(
   'documents',
   {
@@ -55,6 +148,7 @@ export const documents = pgTable(
       .references(() => workspaces.id, { onDelete: 'cascade' }),
     title: text('title').notNull(),
     content: text('content').notNull().default(''),
+    crdtState: text('crdt_state'),
     createdByUserId: text('created_by_user_id').notNull(),
     updatedByUserId: text('updated_by_user_id').notNull(),
     archivedAt: timestamp('archived_at', { withTimezone: true }),
@@ -169,6 +263,13 @@ export const workspacesRelations = relations(workspaces, ({ many }) => ({
 export const workspaceMembersRelations = relations(workspaceMembers, ({ one }) => ({
   workspace: one(workspaces, {
     fields: [workspaceMembers.workspaceId],
+    references: [workspaces.id],
+  }),
+}))
+
+export const workspaceInvitesRelations = relations(workspaceInvites, ({ one }) => ({
+  workspace: one(workspaces, {
+    fields: [workspaceInvites.workspaceId],
     references: [workspaces.id],
   }),
 }))

@@ -2,10 +2,10 @@ import { randomUUID } from 'node:crypto'
 import { Router } from 'express'
 import { and, desc, eq, inArray, isNull, max } from 'drizzle-orm'
 import { db } from '../db/index.js'
-import { auditEvents, fileVersions, files, folders } from '../db/schema.js'
+import { auditEvents, fileVersions, files, folders, resourcePermissions } from '../db/schema.js'
 import { env } from '../env.js'
 import { createDownloadUrl, createUploadUrl, statStoredObject } from '../lib/object-storage.js'
-import { requireWorkspaceRole } from '../lib/workspace-access.js'
+import { getEffectiveResourcePermission, requireResourcePermission, requireWorkspaceRole } from '../lib/workspace-access.js'
 import { requireAuth } from '../middleware/auth.js'
 
 export const filesRouter = Router()
@@ -146,6 +146,24 @@ async function getVisibleFile(workspaceId: string, fileId: string) {
   return file ?? null
 }
 
+async function serializeFileForUser(userId: string, file: Awaited<ReturnType<typeof getVisibleFile>>) {
+  if (!file) {
+    return null
+  }
+
+  const permission = await getEffectiveResourcePermission(userId, file.workspaceId, 'file', file.id)
+
+  if (!permission) {
+    return null
+  }
+
+  return {
+    ...file,
+    effectivePermission: permission.level,
+    sharedWithMe: permission.sharedWithMe,
+  }
+}
+
 async function ensureFolderTarget(workspaceId: string, folderId: string | null) {
   if (!folderId) {
     return true
@@ -213,16 +231,48 @@ filesRouter.get('/workspaces/:workspaceId/drive', async (req, res) => {
     return
   }
 
+  if (access.membership.role === 'viewer' && folderId) {
+    res.status(403).json({ error: 'Shared files are listed at the root of your drive view.' })
+    return
+  }
+
+  const sharedFileIds =
+    access.membership.role === 'viewer'
+      ? (
+          await db
+            .select({ resourceId: resourcePermissions.resourceId })
+            .from(resourcePermissions)
+            .where(
+              and(
+                eq(resourcePermissions.workspaceId, workspaceId),
+                eq(resourcePermissions.resourceType, 'file'),
+                eq(resourcePermissions.userId, userId),
+              ),
+            )
+        ).map((grant) => grant.resourceId)
+      : null
+
+  if (sharedFileIds && sharedFileIds.length === 0) {
+    res.json({ currentFolderId: folderId, folders: [], files: [], nextCursor: null })
+    return
+  }
+
   const [folderRows, fileRows] = await Promise.all([
-    db
-      .select(folderListFields())
-      .from(folders)
-      .where(parentFolderCondition(workspaceId, folderId))
-      .orderBy(desc(folders.updatedAt)),
+    sharedFileIds
+      ? Promise.resolve([])
+      : db
+          .select(folderListFields())
+          .from(folders)
+          .where(parentFolderCondition(workspaceId, folderId))
+          .orderBy(desc(folders.updatedAt)),
     db
       .select(fileListFields())
       .from(files)
-      .where(fileFolderCondition(workspaceId, folderId))
+      .where(
+        sharedFileIds
+          ? and(eq(files.workspaceId, workspaceId), inArray(files.id, sharedFileIds), isNull(files.archivedAt))
+          : fileFolderCondition(workspaceId, folderId),
+      )
       .orderBy(desc(files.updatedAt))
       .limit(limit + 1)
       .offset(cursor),
@@ -230,11 +280,14 @@ filesRouter.get('/workspaces/:workspaceId/drive', async (req, res) => {
 
   const hasMore = fileRows.length > limit
   const pageFiles = hasMore ? fileRows.slice(0, limit) : fileRows
+  const serializedFiles = (await Promise.all(pageFiles.map((file) => serializeFileForUser(userId, file)))).filter(
+    Boolean,
+  )
 
   res.json({
     currentFolderId: folderId,
     folders: folderRows,
-    files: pageFiles,
+    files: serializedFiles,
     nextCursor: hasMore ? cursor + limit : null,
   })
 })
@@ -450,6 +503,15 @@ filesRouter.post('/workspaces/:workspaceId/files/upload-intents', async (req, re
         })
         .returning()
 
+      await tx.insert(resourcePermissions).values({
+        workspaceId,
+        resourceType: 'file',
+        resourceId: createdFile.id,
+        userId,
+        level: 'owner',
+        grantedByUserId: userId,
+      })
+
       await tx.insert(auditEvents).values({
         actorUserId: userId,
         action: 'file.upload_intent.created',
@@ -457,7 +519,7 @@ filesRouter.post('/workspaces/:workspaceId/files/upload-intents', async (req, re
         metadata: JSON.stringify({ fileId: createdFile.id, versionId: createdVersion.id, folderId, name }),
       })
 
-      return { file: createdFile, version: createdVersion }
+      return { file: { ...createdFile, effectivePermission: 'owner', sharedWithMe: false }, version: createdVersion }
     })
 
     const uploadUrl = await createUploadUrl(payload.version.objectKey)
@@ -478,10 +540,10 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/replacement-upload-inte
   const mimeType = normalizeMimeType(req.body?.mimeType)
   const sizeBytes = normalizeSizeBytes(req.body?.sizeBytes)
   const checksum = normalizeChecksum(req.body?.checksum)
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -494,6 +556,13 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/replacement-upload-inte
 
   if (!existingFile) {
     res.status(404).json({ error: 'File not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId, 'edit')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -526,7 +595,10 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/replacement-upload-inte
       metadata: JSON.stringify({ fileId, versionId: createdVersion.id, versionNumber: nextVersion }),
     })
 
-    return { file: existingFile, version: createdVersion }
+    return {
+      file: { ...existingFile, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') },
+      version: createdVersion,
+    }
   })
 
   const uploadUrl = await createUploadUrl(payload.version.objectKey)
@@ -537,10 +609,10 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/replacement-upload-inte
 filesRouter.post('/workspaces/:workspaceId/files/:fileId/versions/:versionId/complete', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId, versionId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -548,6 +620,13 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/versions/:versionId/com
 
   if (!existingFile) {
     res.status(404).json({ error: 'File not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId, 'edit')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -619,7 +698,10 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/versions/:versionId/com
       metadata: JSON.stringify({ fileId, versionId, versionNumber: version.versionNumber }),
     })
 
-    return { file, version }
+    return {
+      file: { ...file, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') },
+      version,
+    }
   })
 
   res.json(payload)
@@ -628,7 +710,7 @@ filesRouter.post('/workspaces/:workspaceId/files/:fileId/versions/:versionId/com
 filesRouter.get('/workspaces/:workspaceId/files/:fileId/versions', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId)
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId)
 
   if (!access.ok) {
     res.status(access.status).json({ error: access.error })
@@ -654,7 +736,7 @@ filesRouter.get('/workspaces/:workspaceId/files/:fileId/versions', async (req, r
 filesRouter.get('/workspaces/:workspaceId/files/:fileId/download', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId)
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId)
 
   if (!access.ok) {
     res.status(access.status).json({ error: access.error })
@@ -687,7 +769,7 @@ filesRouter.get('/workspaces/:workspaceId/files/:fileId/download', async (req, r
 filesRouter.get('/workspaces/:workspaceId/files/:fileId/versions/:versionId/download', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId, versionId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId)
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId)
 
   if (!access.ok) {
     res.status(access.status).json({ error: access.error })
@@ -720,10 +802,10 @@ filesRouter.get('/workspaces/:workspaceId/files/:fileId/versions/:versionId/down
 filesRouter.patch('/workspaces/:workspaceId/files/:fileId', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -731,6 +813,13 @@ filesRouter.patch('/workspaces/:workspaceId/files/:fileId', async (req, res) => 
 
   if (!existingFile) {
     res.status(404).json({ error: 'File not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId, 'edit')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -744,6 +833,11 @@ filesRouter.patch('/workspaces/:workspaceId/files/:fileId', async (req, res) => 
 
   if (!(await ensureFolderTarget(workspaceId, folderId))) {
     res.status(404).json({ error: 'Folder not found' })
+    return
+  }
+
+  if (workspaceAccess.membership.role === 'viewer' && folderId !== existingFile.folderId) {
+    res.status(403).json({ error: 'Only workspace members can move shared files between folders.' })
     return
   }
 
@@ -765,7 +859,7 @@ filesRouter.patch('/workspaces/:workspaceId/files/:fileId', async (req, res) => 
       return updatedFile
     })
 
-    res.json({ file })
+    res.json({ file: { ...file, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') } })
   } catch (error) {
     if (sendConstraintError(res, error)) {
       return
@@ -778,10 +872,10 @@ filesRouter.patch('/workspaces/:workspaceId/files/:fileId', async (req, res) => 
 filesRouter.delete('/workspaces/:workspaceId/files/:fileId', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, fileId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -789,6 +883,13 @@ filesRouter.delete('/workspaces/:workspaceId/files/:fileId', async (req, res) =>
 
   if (!existingFile) {
     res.status(404).json({ error: 'File not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'file', fileId, 'owner')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -809,5 +910,5 @@ filesRouter.delete('/workspaces/:workspaceId/files/:fileId', async (req, res) =>
     return [archivedFile]
   })
 
-  res.json({ file })
+  res.json({ file: { ...file, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') } })
 })

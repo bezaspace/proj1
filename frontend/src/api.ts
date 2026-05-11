@@ -6,6 +6,9 @@ export type Workspace = {
   updatedAt: string
 }
 
+export type WorkspaceRole = Workspace['role']
+export type ResourcePermissionLevel = 'view' | 'edit' | 'owner'
+
 export type Document = {
   id: string
   workspaceId: string
@@ -16,6 +19,8 @@ export type Document = {
   archivedAt: string | null
   createdAt: string
   updatedAt: string
+  effectivePermission: ResourcePermissionLevel
+  sharedWithMe: boolean
 }
 
 export type DocumentVersion = {
@@ -55,6 +60,65 @@ export type DriveFile = {
   archivedAt: string | null
   createdAt: string
   updatedAt: string
+  effectivePermission: ResourcePermissionLevel
+  sharedWithMe: boolean
+}
+
+export type WorkspaceMember = {
+  id: string
+  workspaceId: string
+  userId: string
+  role: WorkspaceRole
+  createdAt: string
+  updatedAt: string
+  userName: string
+  userEmail: string
+}
+
+export type WorkspaceInvite = {
+  id: string
+  workspaceId: string
+  workspaceName?: string
+  email: string
+  role: WorkspaceRole
+  status: 'pending' | 'accepted' | 'revoked' | 'expired'
+  invitedByUserId: string
+  acceptedByUserId: string | null
+  expiresAt: string
+  acceptedAt: string | null
+  revokedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export type ResourceGrant = {
+  id: string
+  workspaceId: string
+  resourceType: 'document' | 'file'
+  resourceId: string
+  userId: string
+  level: ResourcePermissionLevel
+  grantedByUserId: string
+  createdAt: string
+  updatedAt: string
+  userName: string
+  userEmail: string
+}
+
+export type Notification = {
+  id: string
+  recipientUserId: string
+  actorUserId: string
+  workspaceId: string | null
+  type: 'workspace_invite' | 'document_shared' | 'file_shared'
+    | 'document_updated'
+  entityType: string
+  entityId: string
+  title: string
+  body: string
+  metadata: string | null
+  readAt: string | null
+  createdAt: string
 }
 
 export type FileVersion = {
@@ -122,6 +186,37 @@ export function createWorkspace(name: string) {
   })
 }
 
+export function getWorkspaceMembers(workspaceId: string) {
+  return request<{ members: WorkspaceMember[] }>(`/api/workspaces/${workspaceId}/members`)
+}
+
+export function getWorkspaceInvites(workspaceId: string) {
+  return request<{ invites: WorkspaceInvite[] }>(`/api/workspaces/${workspaceId}/invites`)
+}
+
+export function createWorkspaceInvite(workspaceId: string, input: { email: string; role: WorkspaceRole }) {
+  return request<{ invite: WorkspaceInvite }>(`/api/workspaces/${workspaceId}/invites`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function revokeWorkspaceInvite(workspaceId: string, inviteId: string) {
+  return request<{ invite: WorkspaceInvite }>(`/api/workspaces/${workspaceId}/invites/${inviteId}`, {
+    method: 'DELETE',
+  })
+}
+
+export function getMyInvites() {
+  return request<{ invites: WorkspaceInvite[] }>('/api/invites')
+}
+
+export function acceptInvite(inviteId: string) {
+  return request<{ invite: WorkspaceInvite; workspace: Workspace }>(`/api/invites/${inviteId}/accept`, {
+    method: 'POST',
+  })
+}
+
 export function getDocuments(workspaceId: string) {
   return request<{ documents: Document[] }>(`/api/workspaces/${workspaceId}/documents`)
 }
@@ -148,6 +243,28 @@ export function archiveDocument(workspaceId: string, documentId: string) {
 
 export function getDocumentVersions(workspaceId: string, documentId: string) {
   return request<{ versions: DocumentVersion[] }>(`/api/workspaces/${workspaceId}/documents/${documentId}/versions`)
+}
+
+export function getDocumentPermissions(workspaceId: string, documentId: string) {
+  return request<{ grants: ResourceGrant[] }>(`/api/workspaces/${workspaceId}/documents/${documentId}/permissions`)
+}
+
+export function shareDocument(
+  workspaceId: string,
+  documentId: string,
+  input: { email: string; level: ResourcePermissionLevel },
+) {
+  return request<{ grant: ResourceGrant }>(`/api/workspaces/${workspaceId}/documents/${documentId}/permissions`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function revokeDocumentPermission(workspaceId: string, documentId: string, permissionId: string) {
+  return request<{ grant: ResourceGrant }>(
+    `/api/workspaces/${workspaceId}/documents/${documentId}/permissions/${permissionId}`,
+    { method: 'DELETE' },
+  )
 }
 
 export function getDriveItems(workspaceId: string, folderId: string | null, cursor = 0) {
@@ -211,6 +328,23 @@ export function getFileVersions(workspaceId: string, fileId: string) {
   return request<{ versions: FileVersion[] }>(`/api/workspaces/${workspaceId}/files/${fileId}/versions`)
 }
 
+export function getFilePermissions(workspaceId: string, fileId: string) {
+  return request<{ grants: ResourceGrant[] }>(`/api/workspaces/${workspaceId}/files/${fileId}/permissions`)
+}
+
+export function shareFile(workspaceId: string, fileId: string, input: { email: string; level: ResourcePermissionLevel }) {
+  return request<{ grant: ResourceGrant }>(`/api/workspaces/${workspaceId}/files/${fileId}/permissions`, {
+    method: 'POST',
+    body: JSON.stringify(input),
+  })
+}
+
+export function revokeFilePermission(workspaceId: string, fileId: string, permissionId: string) {
+  return request<{ grant: ResourceGrant }>(`/api/workspaces/${workspaceId}/files/${fileId}/permissions/${permissionId}`, {
+    method: 'DELETE',
+  })
+}
+
 export function getFileDownload(workspaceId: string, fileId: string) {
   return request<{ downloadUrl: string; expiresInSeconds: number }>(`/api/workspaces/${workspaceId}/files/${fileId}/download`)
 }
@@ -231,5 +365,26 @@ export function updateFile(workspaceId: string, fileId: string, input: { name?: 
 export function archiveFile(workspaceId: string, fileId: string) {
   return request<{ file: DriveFile }>(`/api/workspaces/${workspaceId}/files/${fileId}`, {
     method: 'DELETE',
+  })
+}
+
+export function getNotifications(unreadOnly = false) {
+  const params = unreadOnly ? '?unreadOnly=true' : ''
+  return request<{ notifications: Notification[] }>(`/api/notifications${params}`)
+}
+
+export function getUnreadNotificationCount() {
+  return request<{ unreadCount: number }>('/api/notifications/unread-count')
+}
+
+export function markNotificationRead(notificationId: string) {
+  return request<{ notification: Notification }>(`/api/notifications/${notificationId}/read`, {
+    method: 'PATCH',
+  })
+}
+
+export function markAllNotificationsRead() {
+  return request<{ updatedCount: number }>('/api/notifications/mark-all-read', {
+    method: 'POST',
   })
 }

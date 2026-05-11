@@ -25,9 +25,5 @@ dist/
 build/
 *.log
 
-# Local reference docs
-Phase 0-7.md
-systemDesignINterveiw-volume1.md
-
 # Devin
 .devin/config.local.json

@@ -18,7 +18,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -43,7 +44,8 @@ button.secondary {
   color: #243043;
 }
 
-input {
+input,
+select {
   width: 100%;
   min-height: 42px;
   border: 1px solid #cad5e2;
@@ -131,6 +133,60 @@ label {
   color: #536279;
 }
 
+.notification-wrap {
+  position: relative;
+}
+
+.notification-panel {
+  position: absolute;
+  right: 0;
+  z-index: 10;
+  display: grid;
+  gap: 12px;
+  width: min(360px, calc(100vw - 32px));
+  max-height: 440px;
+  overflow: auto;
+  margin-top: 8px;
+  border: 1px solid #d8e1ec;
+  border-radius: 8px;
+  padding: 14px;
+  background: #fff;
+  box-shadow: 0 20px 70px rgb(29 48 82 / 18%);
+}
+
+.notification-list,
+.member-list,
+.grant-list {
+  display: grid;
+  gap: 8px;
+}
+
+.notification-item {
+  display: grid;
+  gap: 5px;
+  min-height: auto;
+  border: 1px solid #d8e1ec;
+  background: #fff;
+  color: #243043;
+  padding: 10px;
+  text-align: left;
+}
+
+.notification-item.unread {
+  border-color: #1f6f68;
+  background: #e9f6f4;
+}
+
+.notification-item span,
+.notification-item small,
+.invite-row small,
+.member-row small,
+.grant-row small {
+  color: #66758b;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
 .workspace-layout {
   display: grid;
   grid-template-columns: 320px 1fr;
@@ -184,6 +240,37 @@ label {
   color: #66758b;
   font-weight: 800;
   text-transform: uppercase;
+}
+
+.invite-box {
+  display: grid;
+  gap: 10px;
+  border: 1px solid #d8e1ec;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fff;
+}
+
+.invite-box h3,
+.panel-heading h3 {
+  margin: 0;
+}
+
+.invite-row,
+.member-row,
+.grant-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.invite-row div,
+.member-row div,
+.grant-row div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
 }
 
 .create-form,
@@ -313,6 +400,51 @@ label {
   margin-right: auto;
 }
 
+.realtime-status {
+  display: inline-grid;
+  place-items: center;
+  min-height: 28px;
+  border: 1px solid #cad5e2;
+  border-radius: 999px;
+  padding: 0 10px;
+  color: #536279;
+  font-size: 0.72rem;
+  font-weight: 900;
+  text-transform: uppercase;
+}
+
+.realtime-status.connected {
+  border-color: #1f6f68;
+  background: #e9f6f4;
+  color: #1f6f68;
+}
+
+.realtime-status.connecting {
+  border-color: #c4861a;
+  background: #fff7e8;
+  color: #8a5a05;
+}
+
+.collaborators {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.collaborators span {
+  display: inline-grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #1f6f68;
+  color: #fff;
+  font-size: 0.78rem;
+  font-weight: 900;
+  box-shadow: 0 0 0 1px #cad5e2;
+}
+
 .empty-editor {
   display: grid;
   place-items: center;
@@ -328,11 +460,59 @@ label {
 }
 
 .version-panel,
-.file-details {
+.file-details,
+.share-panel,
+.people-panel {
   border: 1px solid #d8e1ec;
   border-radius: 8px;
   padding: 16px;
   background: #f8fafc;
+}
+
+.share-panel,
+.people-view {
+  display: grid;
+  gap: 14px;
+}
+
+.share-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 120px auto;
+  gap: 10px;
+}
+
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.people-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(300px, 0.8fr);
+  gap: 18px;
+  align-items: start;
+}
+
+.people-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.member-row,
+.grant-row {
+  border: 1px solid #d8e1ec;
+  border-radius: 8px;
+  padding: 10px;
+  background: #fff;
+}
+
+.member-row span {
+  color: #1f6f68;
+  font-size: 0.78rem;
+  font-weight: 900;
+  text-transform: uppercase;
 }
 
 .version-layout {
@@ -629,7 +809,9 @@ button.compact {
   .files-grid,
   .version-layout,
   .inline-form,
-  .drive-item {
+  .drive-item,
+  .share-form,
+  .people-grid {
     grid-template-columns: 1fr;
   }
 
@@ -642,6 +824,11 @@ button.compact {
   .user-menu {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .notification-panel {
+    left: 0;
+    right: auto;
   }
 
   .sidebar {

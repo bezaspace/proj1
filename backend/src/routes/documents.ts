@@ -1,8 +1,8 @@
 import { Router } from 'express'
-import { and, desc, eq, isNull, max } from 'drizzle-orm'
+import { and, desc, eq, inArray, isNull, max } from 'drizzle-orm'
 import { db } from '../db/index.js'
-import { auditEvents, documentVersions, documents } from '../db/schema.js'
-import { requireWorkspaceRole } from '../lib/workspace-access.js'
+import { auditEvents, documentVersions, documents, resourcePermissions } from '../db/schema.js'
+import { getEffectiveResourcePermission, requireResourcePermission, requireWorkspaceRole } from '../lib/workspace-access.js'
 import { requireAuth } from '../middleware/auth.js'
 
 export const documentsRouter = Router()
@@ -41,6 +41,24 @@ async function getVisibleDocument(workspaceId: string, documentId: string) {
   return document ?? null
 }
 
+async function serializeDocumentForUser(userId: string, document: Awaited<ReturnType<typeof getVisibleDocument>>) {
+  if (!document) {
+    return null
+  }
+
+  const permission = await getEffectiveResourcePermission(userId, document.workspaceId, 'document', document.id)
+
+  if (!permission) {
+    return null
+  }
+
+  return {
+    ...document,
+    effectivePermission: permission.level,
+    sharedWithMe: permission.sharedWithMe,
+  }
+}
+
 documentsRouter.get('/workspaces/:workspaceId/documents', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId } = req.params
@@ -51,13 +69,42 @@ documentsRouter.get('/workspaces/:workspaceId/documents', async (req, res) => {
     return
   }
 
+  const documentIds =
+    access.membership.role === 'viewer'
+      ? (
+          await db
+            .select({ resourceId: resourcePermissions.resourceId })
+            .from(resourcePermissions)
+            .where(
+              and(
+                eq(resourcePermissions.workspaceId, workspaceId),
+                eq(resourcePermissions.resourceType, 'document'),
+                eq(resourcePermissions.userId, userId),
+              ),
+            )
+        ).map((grant) => grant.resourceId)
+      : null
+
+  if (documentIds && documentIds.length === 0) {
+    res.json({ documents: [] })
+    return
+  }
+
   const rows = await db
     .select(documentListFields())
     .from(documents)
-    .where(and(eq(documents.workspaceId, workspaceId), isNull(documents.archivedAt)))
+    .where(
+      documentIds
+        ? and(eq(documents.workspaceId, workspaceId), inArray(documents.id, documentIds), isNull(documents.archivedAt))
+        : and(eq(documents.workspaceId, workspaceId), isNull(documents.archivedAt)),
+    )
     .orderBy(desc(documents.updatedAt))
 
-  res.json({ documents: rows })
+  const serializedRows = (await Promise.all(rows.map((document) => serializeDocumentForUser(userId, document)))).filter(
+    Boolean,
+  )
+
+  res.json({ documents: serializedRows })
 })
 
 documentsRouter.post('/workspaces/:workspaceId/documents', async (req, res) => {
@@ -97,6 +144,15 @@ documentsRouter.post('/workspaces/:workspaceId/documents', async (req, res) => {
       editorUserId: userId,
     })
 
+    await tx.insert(resourcePermissions).values({
+      workspaceId,
+      resourceType: 'document',
+      resourceId: createdDocument.id,
+      userId,
+      level: 'owner',
+      grantedByUserId: userId,
+    })
+
     await tx.insert(auditEvents).values({
       actorUserId: userId,
       action: 'document.created',
@@ -107,7 +163,7 @@ documentsRouter.post('/workspaces/:workspaceId/documents', async (req, res) => {
     return createdDocument
   })
 
-  res.status(201).json({ document })
+  res.status(201).json({ document: { ...document, effectivePermission: 'owner', sharedWithMe: false } })
 })
 
 documentsRouter.get('/workspaces/:workspaceId/documents/:documentId', async (req, res) => {
@@ -127,7 +183,16 @@ documentsRouter.get('/workspaces/:workspaceId/documents/:documentId', async (req
     return
   }
 
-  res.json({ document })
+  const permission = await requireResourcePermission(userId, workspaceId, 'document', documentId)
+
+  if (!permission.ok) {
+    res.status(permission.status).json({ error: permission.error })
+    return
+  }
+
+  res.json({
+    document: { ...document, effectivePermission: permission.level, sharedWithMe: Boolean(permission.grant && permission.grant.level !== 'owner') },
+  })
 })
 
 documentsRouter.get('/workspaces/:workspaceId/documents/:documentId/versions', async (req, res) => {
@@ -144,6 +209,13 @@ documentsRouter.get('/workspaces/:workspaceId/documents/:documentId/versions', a
 
   if (!document) {
     res.status(404).json({ error: 'Document not found' })
+    return
+  }
+
+  const permission = await requireResourcePermission(userId, workspaceId, 'document', documentId)
+
+  if (!permission.ok) {
+    res.status(permission.status).json({ error: permission.error })
     return
   }
 
@@ -167,10 +239,10 @@ documentsRouter.get('/workspaces/:workspaceId/documents/:documentId/versions', a
 documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, documentId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -178,6 +250,13 @@ documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (r
 
   if (!existingDocument) {
     res.status(404).json({ error: 'Document not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'document', documentId, 'edit')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -202,6 +281,7 @@ documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (r
       .set({
         title,
         content,
+        crdtState: null,
         updatedByUserId: userId,
         updatedAt: new Date(),
       })
@@ -226,16 +306,18 @@ documentsRouter.patch('/workspaces/:workspaceId/documents/:documentId', async (r
     return updatedDocument
   })
 
-  res.json({ document })
+  res.json({
+    document: { ...document, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') },
+  })
 })
 
 documentsRouter.delete('/workspaces/:workspaceId/documents/:documentId', async (req, res) => {
   const userId = req.auth!.user.id
   const { workspaceId, documentId } = req.params
-  const access = await requireWorkspaceRole(userId, workspaceId, 'member')
+  const workspaceAccess = await requireWorkspaceRole(userId, workspaceId)
 
-  if (!access.ok) {
-    res.status(access.status).json({ error: access.error })
+  if (!workspaceAccess.ok) {
+    res.status(workspaceAccess.status).json({ error: workspaceAccess.error })
     return
   }
 
@@ -243,6 +325,13 @@ documentsRouter.delete('/workspaces/:workspaceId/documents/:documentId', async (
 
   if (!existingDocument) {
     res.status(404).json({ error: 'Document not found' })
+    return
+  }
+
+  const access = await requireResourcePermission(userId, workspaceId, 'document', documentId, 'owner')
+
+  if (!access.ok) {
+    res.status(access.status).json({ error: access.error })
     return
   }
 
@@ -282,5 +371,7 @@ documentsRouter.delete('/workspaces/:workspaceId/documents/:documentId', async (
     return archivedDocument
   })
 
-  res.json({ document })
+  res.json({
+    document: { ...document, effectivePermission: access.level, sharedWithMe: Boolean(access.grant && access.grant.level !== 'owner') },
+  })
 })

@@ -52,3 +52,26 @@
 
 7. Defer Redis, queues, and rate limiting
 - Do not add generic infrastructure before the product has enough traffic-shaping needs. Revisit rate limits after sharing, realtime, chat, and notifications make the API surface clearer.
+
+## 2026-05-11
+
+1. Start Phase 4 with workspace invites and resource grants
+- Collaboration now begins with explicit workspace invites plus document/file permissions. This gives the backend a real least-privilege surface before adding realtime features.
+
+2. Keep file and document sharing member-scoped
+- Public links and folder sharing remain deferred. Phase 4 focuses on sharing individual documents/files with existing workspace members using view, edit, and owner grants.
+
+3. Persist notifications synchronously for now
+- Invite/share notifications are written in the same product flow as the triggering action. The table shape keeps delivery queue-ready, but Redis and background workers remain deferred.
+
+4. Treat owner grants as the resource-management boundary
+- Resource creators receive owner grants on create. Workspace owners/admins can manage all resources, while resource owners can share, revoke, and archive their own documents/files.
+
+5. Use Yjs for realtime document collaboration
+- Phase 5 starts with a real CRDT instead of last-write-wins broadcasting. Yjs gives conflict-free merging, a credible path to offline editing, and a stronger senior-backend portfolio signal.
+
+6. Use Redis for concrete realtime needs
+- Redis is now introduced because the app has actual ephemeral-state requirements: WebSocket pub/sub, document room presence, and short-window edit rate limiting.
+
+7. Keep PostgreSQL as the document source of truth
+- Realtime updates flow through Yjs and Redis, but durable document content, CRDT snapshots, version history, permissions, audit events, and notifications remain in PostgreSQL.
